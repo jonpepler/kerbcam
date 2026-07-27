@@ -742,6 +742,37 @@ describe("App - settings", () => {
     const cb = screen.getByRole("checkbox", { name: /show static/i }) as HTMLInputElement;
     expect(cb.checked).toBe(false);
   });
+
+  it("record-full-resolution toggle is off by default and persists when switched on", async () => {
+    const { client, openSidecar } = buildFixture([]);
+    await renderApp(client);
+    await act(async () => { openSidecar(); });
+
+    fireEvent.click(screen.getByRole("button", { name: /settings/i }));
+    await waitFor(() => screen.getByRole("dialog"));
+
+    const cb = screen.getByRole("checkbox", { name: /record at full resolution/i }) as HTMLInputElement;
+    expect(cb.checked).toBe(false);
+
+    await act(async () => {
+      fireEvent.click(cb);
+    });
+    expect(localStorage.getItem("kerbcast:recordFullResolution")).toBe("true");
+  });
+
+  it("record-full-resolution=true is restored on the next visit", async () => {
+    localStorage.setItem("kerbcast:recordFullResolution", "true");
+
+    const { client, openSidecar } = buildFixture([]);
+    await renderApp(client);
+    await act(async () => { openSidecar(); });
+
+    fireEvent.click(screen.getByRole("button", { name: /settings/i }));
+    await waitFor(() => screen.getByRole("dialog"));
+
+    const cb = screen.getByRole("checkbox", { name: /record at full resolution/i }) as HTMLInputElement;
+    expect(cb.checked).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -415,6 +415,9 @@ async fn consume_loop(
             // Subscribe), which a binding-scoped clear would leak forever
             // (the v1.6.3 pin-high class).
             registry.forget_display_size_all(peer.peer_id).await;
+            // Same peer-scoped sweep for any force this peer held, so a feed
+            // never stays pinned at the ceiling after a dead-peer reap.
+            registry.forget_forced_all(peer.peer_id).await;
         }
 
         let cameras = registry.snapshot().await;

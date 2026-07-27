@@ -48,6 +48,16 @@ export interface KerbcastCameraHandle {
   readonly stalled: boolean;
   /** Current {@link setShowStatic} setting. */
   readonly showStatic: boolean;
+  /**
+   * The feed's physical/ceiling maximum render size (`DiscoveredCamera.maxWidth`
+   * / `maxHeight`), or `null` until known. Populated from a prior
+   * `client.discover()` call (there is no live-pushed field for it), so a
+   * consumer that never calls `discover()` sees `null` here indefinitely.
+   * Used by `RecordingController` to recognise a force-full-resolution feed
+   * that has actually reached its ceiling, as opposed to one merely
+   * unchanged since before the force was sent.
+   */
+  readonly maxRenderSize: { width: number; height: number } | null;
 
   setLayers(layers: Layer[]): Promise<void>;
   setRenderSize(width: number, height: number): Promise<void>;
@@ -79,6 +89,15 @@ export interface KerbcastCameraHandle {
    * machinery keeps overriding it downward while throttled.
    */
   setQuality(preset: QualityPreset | null): Promise<void>;
+  /**
+   * Force this feed to render at the operator's configured maximum
+   * regardless of display size, until released by calling this with
+   * `false`. Per-viewer, OR-aggregated server-side across viewers: a feed
+   * stays forced while any viewer forces it, and releases when the last one
+   * clears it (or disconnects). Still yields to the adaptive framerate
+   * shed; it only overrides the display-size demand term.
+   */
+  setForceFullResolution(force: boolean): Promise<void>;
   requestKeyframe(): Promise<void>;
 
   /**
@@ -519,6 +538,10 @@ class CameraHandle
     return this._showStatic;
   }
 
+  get maxRenderSize(): { width: number; height: number } | null {
+    return this.client._maxRenderSize(this.flightId);
+  }
+
   configure(options: { noise?: Partial<NoiseConfig> }): void {
     this._noiseOverride = options.noise ?? null;
     // Re-evaluate with the new noise setting: rebuild from whatever source
@@ -749,6 +772,13 @@ class CameraHandle
     });
   }
 
+  async setForceFullResolution(force: boolean): Promise<void> {
+    await this.client._send({
+      type: "set-force-full-resolution",
+      content: { flightId: this.flightId, force },
+    });
+  }
+
   async requestKeyframe(): Promise<void> {
     await this.client._send({
       type: "request-keyframe",
@@ -828,6 +858,13 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   private _inFlight: boolean | undefined = undefined;
   /** Client-side recording controller, lazily built on first `recording` access. */
   private _recording: RecordingController | null = null;
+  /**
+   * Physical/ceiling max render size per camera, cached from the last
+   * `discover()` call. Empty until `discover()` has been called at least
+   * once; a camera absent from the last discovery response is simply
+   * missing here (its handle's `maxRenderSize` reads `null`).
+   */
+  private readonly maxRenderSizeByFlight = new Map<number, { width: number; height: number }>();
 
   constructor(cfg: KerbcastClientConfig, transport?: KerbcastTransport) {
     super();
@@ -922,7 +959,21 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
     const res = await fetch(`http://${this.cfg.host}:${this.cfg.port}/cameras`);
     if (!res.ok) throw new Error(`/cameras returned ${res.status}`);
     const body = (await res.json()) as { cameras: DiscoveredCamera[] };
+    for (const cam of body.cameras) {
+      this.maxRenderSizeByFlight.set(cam.flightId, {
+        width: cam.maxWidth,
+        height: cam.maxHeight,
+      });
+    }
     return body.cameras;
+  }
+
+  /**
+   * Internal: backs {@link KerbcastCameraHandle.maxRenderSize}. `null` when
+   * `discover()` has never been called or never reported this camera.
+   */
+  _maxRenderSize(flightId: number): { width: number; height: number } | null {
+    return this.maxRenderSizeByFlight.get(flightId) ?? null;
   }
 
   /**

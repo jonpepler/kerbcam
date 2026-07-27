@@ -29,6 +29,9 @@ interface GridProps {
   onTilesChange: (tiles: TileData[]) => void;
   showDebugInfo: boolean;
   showStatic: boolean;
+  /** Whether single-feed REC records this feed at full resolution (the
+   *  persisted Settings toggle, threaded straight into CameraFeed). */
+  recordFullResolution: boolean;
   /** REC+ grouped-recording selection mode (see Tile's own doc-comment). */
   selectionMode: boolean;
   selectedFlightIds: ReadonlySet<number>;
@@ -43,6 +46,7 @@ export function Grid({
   onTilesChange,
   showDebugInfo,
   showStatic,
+  recordFullResolution,
   selectionMode,
   selectedFlightIds,
   onToggleSelect,
@@ -182,6 +186,7 @@ export function Grid({
           mergeCrew={mergeCrew}
           showDebugInfo={showDebugInfo}
           showStatic={showStatic}
+          recordFullResolution={recordFullResolution}
           onSelectCamera={(fid) => handleSelectCamera(i, fid)}
           onRemove={() => handleRemove(i)}
           onToggleSpotlight={() => handleToggleSpotlight(i)}

@@ -37,6 +37,15 @@ const MOCK_CAMERAS: MockCameraInit[] = [
     renderHeight: 720,
     operatorWidth: 1280,
     operatorHeight: 720,
+    /*
+     * Ceiling above the current display size: gives "Record at full
+     * resolution" something to visibly bump to (1280x720 -> 1920x1080) when
+     * forced, instead of a no-op force on a feed that's already at its
+     * ceiling. See MockSidecar's force-full-resolution handling in
+     * @ksp-gonogo/kerbcast/testing.
+     */
+    maxWidth: 1920,
+    maxHeight: 1080,
     encoderBitrateBps: 2_000_000,
   },
   {
@@ -193,7 +202,14 @@ const CAMERA_HUES = [210, 30, 140, 0, 265, 320, 95, 45, 175];
  * torn down by the manager's first connect()).
  */
 export async function createMockClient(): Promise<KerbcastClient> {
-  const sidecar = new MockSidecar();
+  /*
+   * forceBumpDelayMs: how long a forced camera takes to report its bumped
+   * (or, on release, reverted) resolution, per MockSidecar's
+   * force-full-resolution handling. 900ms models the real control-file ->
+   * plugin -> renegotiation round trip and is long enough for a screenshot
+   * to catch a tile's "ARMING" pill before it clears.
+   */
+  const sidecar = new MockSidecar({ forceBumpDelayMs: 900 });
   sidecar.withSlots(["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"]);
 
   for (const cam of MOCK_CAMERAS) {
@@ -257,8 +273,19 @@ export async function createMockClient(): Promise<KerbcastClient> {
     sidecar.createTransport(),
   );
 
-  // Intercept /profile before the app's DevPanel starts polling
-  interceptProfileFetch();
+  // Intercept /profile and /cameras before the app's DevPanel starts polling
+  // or discover() is called.
+  interceptMockFetch(sidecar);
+
+  /*
+   * Populate maxRenderSize (client.camera(id).maxRenderSize) up front, the
+   * same way a consumer would call discover() before subscribing: without
+   * it the force-full-resolution arm-and-wait falls back to its weaker
+   * "operator size increased past baseline" check instead of recognising a
+   * feed that reaches (or already sits at) its true ceiling. See
+   * RecordingController.watchResolutionReady.
+   */
+  await mockClient.discover();
 
   /*
    * Record -> replay dev hook. Closes the loop the recording SDK opens: a
@@ -377,10 +404,15 @@ export function buildReplayTrack(blob: Blob): MediaStreamTrack {
 }
 
 // ---------------------------------------------------------------------------
-// /profile intercept (fetch wrapper for this URL only)
+// /profile + /cameras intercept (fetch wrapper for these URLs only)
 // ---------------------------------------------------------------------------
 
-function interceptProfileFetch(): void {
+/**
+ * Intercepts `fetch("/profile")` (the DevPanel's stagger/perf poll) and
+ * `fetch(".../cameras")` (`KerbcastClient.discover()`) with plausible mock
+ * responses. Everything else falls through to the real `fetch`.
+ */
+function interceptMockFetch(sidecar: MockSidecar): void {
   const original = globalThis.fetch.bind(globalThis);
   globalThis.fetch = (
     input: RequestInfo | URL,
@@ -401,6 +433,14 @@ function interceptProfileFetch(): void {
       };
       return Promise.resolve(
         new Response(JSON.stringify(data), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+    }
+    if (url.endsWith("/cameras")) {
+      return Promise.resolve(
+        new Response(JSON.stringify({ cameras: sidecar.discoveredCameras() }), {
           status: 200,
           headers: { "Content-Type": "application/json" },
         }),

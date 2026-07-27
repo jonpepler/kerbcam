@@ -1,6 +1,7 @@
 import type { AdaptiveShedPayload, CameraState, ClientMessage, ErrorPayload, ServerMessage, SettingsStatePayload } from "../__generated__/types";
 import { CameraKind, CameraLifecycle, CrewLocation, ErrorSource, Layer, QualityPreset, TrackMode } from "../__generated__/types";
 import type {
+  DiscoveredCamera,
   InboundVideoStats,
   KerbcastConnectionState,
   KerbcastDataChannel,
@@ -46,6 +47,16 @@ export interface MockCameraInit {
   qualityLimitedBy?: string;
   /** Server-authoritative auto-track mode. Defaults to `None` (untracked). */
   trackMode?: TrackMode;
+  /**
+   * Physical/ceiling render size, served by the mock's `/cameras` discovery
+   * intercept (`DiscoveredCamera.maxWidth`/`maxHeight`). Defaults to
+   * `operatorWidth`/`operatorHeight` (i.e. already at ceiling) so a camera
+   * that never sets these behaves as it always has. Give a camera a ceiling
+   * above its initial `operatorWidth`/`operatorHeight` to demonstrate a
+   * visible bump when `set-force-full-resolution` lands.
+   */
+  maxWidth?: number;
+  maxHeight?: number;
 }
 
 function buildCamera(init: MockCameraInit): CameraState {
@@ -100,6 +111,18 @@ function scaleDim(operatorDim: number, scale: number): number {
   return v < 2 ? 2 : v;
 }
 
+/** Options for {@link MockSidecar}'s constructor. */
+export interface MockSidecarOptions {
+  /**
+   * Delay (ms) before a forced camera's simulated resolution bump lands,
+   * once `set-force-full-resolution` (`force: true`) is received, and
+   * before the render size reverts on `force: false`. Long enough that a
+   * screenshot can catch the resulting "ARMING" state; short enough that
+   * automated tests/waits don't feel slow. Defaults to 600ms.
+   */
+  forceBumpDelayMs?: number;
+}
+
 /**
  * In-process protocol-level fake for the kerbcast sidecar.
  *
@@ -126,6 +149,17 @@ export class MockSidecar {
   private readonly _cameras = new Map<number, CameraState>();
   private readonly _commands: ClientMessage[] = [];
   private _throttleMainScreen = false;
+  private readonly _forceBumpDelayMs: number;
+  /** Per-flight ceiling (ceiling render size), served by `discoveredCameras()`. */
+  private readonly _maxRenderSizes = new Map<number, { maxWidth: number; maxHeight: number }>();
+  /** Per-flight render size captured just before a force bump, restored on release. */
+  private readonly _preForceSize = new Map<number, { width: number; height: number }>();
+  /** Per-flight pending bump/revert timer, so a rapid force/unforce toggle cancels the stale one. */
+  private readonly _forceTimers = new Map<number, ReturnType<typeof setTimeout>>();
+
+  constructor(opts: MockSidecarOptions = {}) {
+    this._forceBumpDelayMs = opts.forceBumpDelayMs ?? 600;
+  }
 
   private _openHandler: (() => void) | undefined;
   private _clientMsgHandler: ((raw: string) => void) | undefined;
@@ -155,7 +189,47 @@ export class MockSidecar {
 
   /** Register a camera that will appear in the `camera-snapshot` sent on `open()`. */
   addCamera(init: MockCameraInit): void {
-    this._cameras.set(init.flightId, buildCamera(init));
+    const cam = buildCamera(init);
+    this._cameras.set(init.flightId, cam);
+    this._maxRenderSizes.set(init.flightId, {
+      maxWidth: init.maxWidth ?? cam.operatorWidth,
+      maxHeight: init.maxHeight ?? cam.operatorHeight,
+    });
+  }
+
+  /**
+   * The `DiscoveredCamera[]` the mock's `GET /cameras` intercept serves,
+   * mirroring the real sidecar's discovery endpoint. `maxWidth`/`maxHeight`
+   * come from each camera's `maxWidth`/`maxHeight` init (or its initial
+   * `operatorWidth`/`operatorHeight` when omitted). Used by
+   * `client.discover()` to populate `KerbcastCameraHandle.maxRenderSize`.
+   */
+  discoveredCameras(): DiscoveredCamera[] {
+    return Array.from(this._cameras.values()).map((cam) => {
+      const max = this._maxRenderSizes.get(cam.flightId);
+      return {
+        flightId: cam.flightId,
+        lifecycle: cam.lifecycle,
+        partName: cam.partName,
+        partTitle: cam.partTitle,
+        cameraName: cam.cameraName,
+        vesselName: cam.vesselName,
+        maxWidth: max?.maxWidth ?? cam.operatorWidth,
+        maxHeight: max?.maxHeight ?? cam.operatorHeight,
+        supportsZoom: cam.supportsZoom,
+        fov: cam.fov,
+        fovMin: cam.fovMin,
+        fovMax: cam.fovMax,
+        supportsPan: cam.supportsPan,
+        panYawMin: cam.panYawMin,
+        panYawMax: cam.panYawMax,
+        panPitchMin: cam.panPitchMin,
+        panPitchMax: cam.panPitchMax,
+        encoderBitrateBps: cam.encoderBitrateBps,
+        targetBitrateBps: cam.targetBitrateBps,
+        degradeLevel: cam.degradeLevel,
+      };
+    });
   }
 
   /**
@@ -250,9 +324,17 @@ export class MockSidecar {
    * {@link destroyCamera}, which keeps the camera present but `Destroyed`.
    */
   setCameras(inits: MockCameraInit[]): void {
+    for (const timer of this._forceTimers.values()) clearTimeout(timer);
+    this._forceTimers.clear();
+    this._preForceSize.clear();
     this._cameras.clear();
+    this._maxRenderSizes.clear();
     for (const init of inits) {
       this._cameras.set(init.flightId, buildCamera(init));
+      this._maxRenderSizes.set(init.flightId, {
+        maxWidth: init.maxWidth ?? init.operatorWidth ?? 1280,
+        maxHeight: init.maxHeight ?? init.operatorHeight ?? 720,
+      });
     }
     this._sendToClient({
       type: "camera-snapshot",
@@ -620,9 +702,69 @@ export class MockSidecar {
         });
         break;
       }
+      case "set-force-full-resolution": {
+        this._setForced(msg.content.flightId, msg.content.force);
+        break;
+      }
       case "disconnect":
         break;
     }
+  }
+
+  /**
+   * Simulate the sidecar's `effective_render_size` force branch: after
+   * {@link _forceBumpDelayMs}, bump the camera's render/operator size to its
+   * ceiling (`force: true`) or restore whatever it was before the force
+   * (`force: false`), pushing a `camera-state-changed` either way. The delay
+   * models the real round trip (control-file write, plugin capture pickup,
+   * WebRTC renegotiation) and gives a UI something to show an "ARMING" state
+   * for. A rapid re-toggle cancels the previous pending bump/revert.
+   */
+  private _setForced(flightId: number, force: boolean): void {
+    const pending = this._forceTimers.get(flightId);
+    if (pending !== undefined) {
+      clearTimeout(pending);
+      this._forceTimers.delete(flightId);
+    }
+
+    const cam = this._cameras.get(flightId);
+    if (!cam) return;
+
+    if (force) {
+      if (!this._preForceSize.has(flightId)) {
+        this._preForceSize.set(flightId, { width: cam.operatorWidth, height: cam.operatorHeight });
+      }
+      const max = this._maxRenderSizes.get(flightId);
+      const timer = setTimeout(() => {
+        this._forceTimers.delete(flightId);
+        this._applyRenderSize(flightId, max?.maxWidth, max?.maxHeight);
+      }, this._forceBumpDelayMs);
+      this._forceTimers.set(flightId, timer);
+    } else {
+      const prior = this._preForceSize.get(flightId);
+      this._preForceSize.delete(flightId);
+      if (!prior) return;
+      const timer = setTimeout(() => {
+        this._forceTimers.delete(flightId);
+        this._applyRenderSize(flightId, prior.width, prior.height);
+      }, this._forceBumpDelayMs);
+      this._forceTimers.set(flightId, timer);
+    }
+  }
+
+  /** Push a render/operator size onto a camera (both fields alike, i.e. no adaptive shed in effect) and broadcast it. */
+  private _applyRenderSize(flightId: number, width: number | undefined, height: number | undefined): void {
+    const cam = this._cameras.get(flightId);
+    if (!cam || width === undefined || height === undefined) return;
+    const updated: CameraState = {
+      ...cam,
+      renderWidth: width,
+      renderHeight: height,
+      operatorWidth: width,
+      operatorHeight: height,
+    };
+    this._cameras.set(flightId, updated);
+    this._sendToClient({ type: "camera-state-changed", content: { state: updated } });
   }
 }
 
@@ -712,6 +854,18 @@ export function installDomStubs(): void {
 class StubMediaStream {
   readonly id: string = Math.random().toString(36).slice(2);
   private readonly _tracks: MediaStreamTrack[] = [];
+
+  /**
+   * Mirrors the real `MediaStream(tracks?)` constructor: the real SDK builds
+   * its per-camera stream as `new MediaStream([track])` on track arrival, so
+   * without this the tracks array is silently dropped and the stream always
+   * reports zero video tracks: the client and anything downstream (e.g. a
+   * real `RecordingController.startRecording`, which requires at least one
+   * live video track) would never see the delivered track.
+   */
+  constructor(tracks: MediaStreamTrack[] = []) {
+    this._tracks.push(...tracks);
+  }
 
   getTracks(): MediaStreamTrack[] {
     return [...this._tracks];

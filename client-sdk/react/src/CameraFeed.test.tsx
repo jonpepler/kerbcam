@@ -60,6 +60,12 @@ const recordingsStoreSpies = vi.hoisted(() => ({
   /** When true, the fake store's stop() rejects instead of resolving -- lets
    *  a test drive CameraFeed's stop-failure path (see "CameraFeed - REC"). */
   stopRejects: false,
+  /** Flips a still-arming fake recording out of arming, simulating the real
+   *  controller's arm-and-wait resolving once the feed reaches full
+   *  resolution. Given its real implementation by the mock factory below
+   *  (it needs the factory's own closured resolver map, unavailable at
+   *  hoist time). */
+  resolveArming: (_recordingId: string) => {},
 }));
 
 vi.mock("./hooks/useRecordings", async () => {
@@ -69,7 +75,16 @@ vi.mock("./hooks/useRecordings", async () => {
     recordingId: string;
     flightId: number;
     startedAt: number;
+    arming: boolean;
   }
+
+  /* recordingId -> the setState callback that flips that entry's arming off,
+     invoked by test code via recordingsStoreSpies.resolveArming. */
+  const armingResolvers = new Map<string, () => void>();
+  recordingsStoreSpies.resolveArming = (recordingId: string) => {
+    armingResolvers.get(recordingId)?.();
+    armingResolvers.delete(recordingId);
+  };
 
   function useRecordings() {
     const [state, setState] = useReactState<{
@@ -77,18 +92,38 @@ vi.mock("./hooks/useRecordings", async () => {
       recordings: unknown[];
     }>({ active: [], recordings: [] });
 
-    const start = useCallback((flightId: number): string => {
-      recordingsStoreSpies.start(flightId);
-      const recordingId = `rec-${flightId}`;
-      setState((s) => ({
-        ...s,
-        active: [...s.active, { recordingId, flightId, startedAt: performance.now() }],
-      }));
-      return recordingId;
-    }, []);
+    const start = useCallback(
+      (flightId: number, opts?: { forceFullResolution?: boolean }): string => {
+        recordingsStoreSpies.start(flightId, opts);
+        const recordingId = `rec-${flightId}`;
+        const forced = opts?.forceFullResolution === true;
+        setState((s) => ({
+          ...s,
+          active: [
+            ...s.active,
+            { recordingId, flightId, startedAt: performance.now(), arming: forced },
+          ],
+        }));
+        if (forced) {
+          armingResolvers.set(recordingId, () => {
+            setState((s) => ({
+              ...s,
+              active: s.active.map((a) =>
+                a.recordingId === recordingId
+                  ? { ...a, arming: false, startedAt: performance.now() }
+                  : a,
+              ),
+            }));
+          });
+        }
+        return recordingId;
+      },
+      [],
+    );
 
     const stop = useCallback(async (recordingId: string) => {
       recordingsStoreSpies.stop(recordingId);
+      armingResolvers.delete(recordingId);
       if (recordingsStoreSpies.stopRejects) {
         throw new Error("stop failed");
       }
@@ -238,6 +273,7 @@ function renderFeed(
     enableQualityControl?: boolean;
     enableTracking?: boolean;
     enableRecording?: boolean;
+    recordFullResolution?: boolean;
     enableFullscreen?: boolean;
     enablePictureInPicture?: boolean;
     actions?: FeedAction[];
@@ -2012,7 +2048,7 @@ describe("CameraFeed - REC", () => {
 
     fireEvent.click(getByLabelText("Start recording"));
 
-    expect(recordingsStoreSpies.start).toHaveBeenCalledWith(42);
+    expect(recordingsStoreSpies.start).toHaveBeenCalledWith(42, { forceFullResolution: false });
     const rec = getByLabelText("Stop recording");
     expect(rec.getAttribute("aria-pressed")).toBe("true");
     expect(getByLabelText("Recording")).toBeTruthy();
@@ -2135,6 +2171,93 @@ describe("CameraFeed - REC", () => {
 
     const after = container.querySelector("video");
     expect(after).toBe(before);
+  });
+});
+
+describe("CameraFeed - recordFullResolution", () => {
+  it("threads recordFullResolution: true into the store's start call", async () => {
+    const { client } = await buildConnectedSource();
+    const { getByLabelText } = renderFeed(client, {
+      flightId: 42,
+      enableRecording: true,
+      recordFullResolution: true,
+    });
+
+    fireEvent.click(getByLabelText("Start recording"));
+
+    expect(recordingsStoreSpies.start).toHaveBeenCalledWith(42, {
+      forceFullResolution: true,
+    });
+  });
+
+  it("sends forceFullResolution: false when the prop is absent (default)", async () => {
+    const { client } = await buildConnectedSource();
+    const { getByLabelText } = renderFeed(client, {
+      flightId: 42,
+      enableRecording: true,
+    });
+
+    fireEvent.click(getByLabelText("Start recording"));
+
+    expect(recordingsStoreSpies.start).toHaveBeenCalledWith(42, {
+      forceFullResolution: false,
+    });
+  });
+
+  it("shows the ARMING pill instead of the REC badge while arming, then swaps to the REC badge", async () => {
+    const { client } = await buildConnectedSource();
+    const { getByLabelText, queryByLabelText } = renderFeed(client, {
+      flightId: 42,
+      enableRecording: true,
+      recordFullResolution: true,
+    });
+
+    fireEvent.click(getByLabelText("Start recording"));
+
+    expect(getByLabelText("Arming").textContent).toBe("ARMING");
+    expect(queryByLabelText("Recording")).toBeNull();
+
+    await act(async () => {
+      recordingsStoreSpies.resolveArming("rec-42");
+    });
+
+    expect(queryByLabelText("Arming")).toBeNull();
+    expect(getByLabelText("Recording").textContent).toMatch(/^REC /);
+  });
+
+  it("never remounts the <video> element across the arming -> recording transition", async () => {
+    const { client } = await buildConnectedSource();
+    const { container, getByLabelText } = renderFeed(client, {
+      flightId: 42,
+      enableRecording: true,
+      recordFullResolution: true,
+    });
+    const before = container.querySelector("video");
+    expect(before).toBeTruthy();
+
+    fireEvent.click(getByLabelText("Start recording"));
+    expect(getByLabelText("Arming")).toBeTruthy();
+
+    await act(async () => {
+      recordingsStoreSpies.resolveArming("rec-42");
+    });
+    expect(getByLabelText("Recording")).toBeTruthy();
+
+    const after = container.querySelector("video");
+    expect(after).toBe(before);
+  });
+
+  it("does not show the ARMING pill when recordFullResolution is false (default)", async () => {
+    const { client } = await buildConnectedSource();
+    const { getByLabelText, queryByLabelText } = renderFeed(client, {
+      flightId: 42,
+      enableRecording: true,
+    });
+
+    fireEvent.click(getByLabelText("Start recording"));
+
+    expect(queryByLabelText("Arming")).toBeNull();
+    expect(getByLabelText("Recording")).toBeTruthy();
   });
 });
 

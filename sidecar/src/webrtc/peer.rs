@@ -53,9 +53,10 @@ use crate::encoder::selected_backend_name;
 use crate::protocol::{
     CameraSnapshotPayload, CameraStateChangedPayload, ClientMessage, ErrorPayload, ErrorSource,
     FlightIdPayload, HelloPayload, Layer, QualityPreset, ReportDisplaySizePayload,
-    SceneStateChangedPayload, ServerMessage, SetDegradePayload, SetFovPayload, SetLayersPayload,
-    SetPanPayload, SetPanRatePayload, SetQualityPayload, SetRenderSizePayload,
-    SetThrottleMainScreenPayload, SetTrackTargetPayload, SetZoomRatePayload, SlotMapPayload,
+    SceneStateChangedPayload, ServerMessage, SetDegradePayload, SetForceFullResolutionPayload,
+    SetFovPayload, SetLayersPayload, SetPanPayload, SetPanRatePayload, SetQualityPayload,
+    SetRenderSizePayload, SetThrottleMainScreenPayload, SetTrackTargetPayload, SetZoomRatePayload,
+    SlotMapPayload,
 };
 
 const CONTROL_CHANNEL_LABEL: &str = "kerbcast-control";
@@ -552,6 +553,18 @@ async fn handle_client_message(
                 info!(enabled, "global control: throttle_main_screen written");
             }
         }
+        // A recording (or other consumer) forcing this camera to the ring
+        // ceiling for as long as it holds the force. OR-aggregated per peer;
+        // forgotten on unsubscribe / disconnect / peer reap (below + in the
+        // consume-loop reaper) so the ceiling relaxes once no peer forces it.
+        ClientMessage::SetForceFullResolution(SetForceFullResolutionPayload {
+            flight_id,
+            force,
+        }) => {
+            registry
+                .set_forced_full_res(flight_id, peer_id, force)
+                .await;
+        }
         ClientMessage::Disconnect => {
             // Graceful teardown: release every camera this peer is feeding now,
             // so they sleep immediately instead of waiting for the ICE drop to
@@ -565,6 +578,9 @@ async fn handle_client_message(
             // Peer-scoped display-size clear: sweeps EVERY camera this peer
             // reported a size for, including any it never bound a slot to.
             registry.forget_display_size_all(peer_id).await;
+            // Same peer-scoped sweep for any force this peer held, so a feed
+            // never stays pinned at the ceiling after its forcer leaves.
+            registry.forget_forced_all(peer_id).await;
         }
     }
 }

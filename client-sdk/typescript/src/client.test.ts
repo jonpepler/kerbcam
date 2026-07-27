@@ -382,6 +382,30 @@ describe("KerbcastClient", () => {
     ]);
   });
 
+  it("set-force-full-resolution routes onto the control channel via the handle", async () => {
+    const { transport, captured } = makeFakeTransport();
+    const client = new KerbcastClient({ host: "h", port: 1 }, transport);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(fakeAnswer());
+
+    await client.connect();
+    captured.dc?._open();
+    captured.dc!.sent.length = 0; // drop the hello
+
+    await client.camera(42).setForceFullResolution(true);
+    await client.camera(42).setForceFullResolution(false);
+
+    expect(captured.dc?.sent).toEqual([
+      JSON.stringify({
+        type: "set-force-full-resolution",
+        content: { flightId: 42, force: true },
+      }),
+      JSON.stringify({
+        type: "set-force-full-resolution",
+        content: { flightId: 42, force: false },
+      }),
+    ]);
+  });
+
   it("reportDisplaySize sends a report-display-size command", async () => {
     const { transport, captured } = makeFakeTransport();
     const client = new KerbcastClient({ host: "h", port: 1 }, transport);

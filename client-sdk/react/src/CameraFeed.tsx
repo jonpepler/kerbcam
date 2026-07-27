@@ -233,6 +233,17 @@ export interface CameraFeedProps {
    */
   enableRecording?: boolean;
   /**
+   * Record this feed at the operator's full render size for the duration of
+   * the built-in REC control's recording (overrides only the display-size
+   * demand; still yields to the adaptive framerate shed). Off by default.
+   * Threaded straight into `start(flightId, { forceFullResolution })`; has
+   * no effect unless `enableRecording` is also set. While the feed is armed
+   * (force sent, waiting for the resolution bump) the tile shows an
+   * "ARMING" pill under the title in place of the REC badge, then switches
+   * to the normal REC badge + elapsed timer once recording actually starts.
+   */
+  recordFullResolution?: boolean;
+  /**
    * Consumer-injected action buttons, rendered left of the built-in
    * fullscreen/PiP controls in the top-right action bar.
    */
@@ -292,6 +303,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       enableQualityControl = false,
       enableTracking = false,
       enableRecording = false,
+      recordFullResolution = false,
       actions,
       trailingActions,
       showActions = true,
@@ -741,6 +753,11 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     const activeRecording = recordingActive
       ? recordings.active.find((a) => a.flightId === flightId)
       : undefined;
+    /* True while a single forced recording is armed (force sent, waiting for
+       the feed to reach full resolution) but the recorder has not started
+       yet (see ActiveRecordingInfo.arming). Drives the ARMING pill below in
+       place of the REC badge. */
+    const armingActive = activeRecording?.arming === true;
 
     // Ticks once a second while recording so the elapsed timer stays live;
     // the timer itself is derived from activeRecording.startedAt each render.
@@ -767,12 +784,12 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
         return;
       }
       try {
-        recordings.start(flightId);
+        recordings.start(flightId, { forceFullResolution: recordFullResolution });
       } catch {
         /* no live track yet, or a race with a recording already in progress
            elsewhere on this feed; the operator can retry once live. */
       }
-    }, [flightId, recordingActive, recordings]);
+    }, [flightId, recordingActive, recordings, recordFullResolution]);
 
     const topOverlay = (
       <TopOverlay>
@@ -1162,7 +1179,13 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                 </StaleBadge>
               </>
             )}
-            {recordingActive && (
+            {recordingActive && armingActive && (
+              <ArmingBadge role="status" aria-label="Arming">
+                <ArmingDot aria-hidden="true" />
+                ARMING
+              </ArmingBadge>
+            )}
+            {recordingActive && !armingActive && (
               <RecBadge role="status" aria-label="Recording">
                 <RecDot aria-hidden="true" />
                 REC {formatElapsed(recordingElapsedMs)}
@@ -1803,6 +1826,52 @@ const RecDot = styled.span`
     }
     50% {
       opacity: 0.4;
+    }
+  }
+`;
+
+/* Arming pill: same slot as RecBadge (a single forced recording shows one or
+   the other, never both), a muted amber so it never reads as the red
+   "recording is live" state: the feed hasn't actually started capturing
+   yet, it's waiting for the resolution bump. */
+const ArmingBadge = styled.div`
+  position: absolute;
+  top: 28px;
+  left: 8px;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 6px;
+  background: rgba(0, 0, 0, 0.6);
+  border: 1px solid var(--kerbcast-arming-active, #d9a441);
+  border-radius: 3px;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9);
+  pointer-events: none;
+`;
+
+const ArmingDot = styled.span`
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--kerbcast-arming-active, #d9a441);
+  flex-shrink: 0;
+
+  @media (prefers-reduced-motion: no-preference) {
+    animation: arming-dot-pulse 0.9s ease-in-out infinite;
+  }
+
+  @keyframes arming-dot-pulse {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.3;
     }
   }
 `;

@@ -9,12 +9,14 @@ interface SettingsProps {
   /** Effective (resolved) value of the show-static setting. */
   showStatic: boolean;
   showPerfWarnings: boolean;
+  recordFullResolution: boolean;
   crewPlacement: CrewBarPlacement;
   crewMerge: boolean;
   onThemeChange: (t: ThemePreference) => void;
   onDebugChange: (enabled: boolean) => void;
   onShowStaticChange: (enabled: boolean) => void;
   onShowPerfWarningsChange: (enabled: boolean) => void;
+  onRecordFullResolutionChange: (enabled: boolean) => void;
   onCrewPlacementChange: (placement: CrewBarPlacement) => void;
   onCrewMergeChange: (merge: boolean) => void;
   onClose: () => void;
@@ -25,12 +27,14 @@ export function Settings({
   debug,
   showStatic,
   showPerfWarnings,
+  recordFullResolution,
   crewPlacement,
   crewMerge,
   onThemeChange,
   onDebugChange,
   onShowStaticChange,
   onShowPerfWarningsChange,
+  onRecordFullResolutionChange,
   onCrewPlacementChange,
   onCrewMergeChange,
   onClose,
@@ -104,6 +108,22 @@ export function Settings({
             type="checkbox"
             checked={showPerfWarnings}
             onChange={(e) => onShowPerfWarningsChange(e.target.checked)}
+            style={{ accentColor: "var(--kc-accent)", width: "1rem", height: "1rem" }}
+          />
+        </FieldRow>
+
+        <SectionLabel style={{ marginTop: "0.75rem" }}>Recording</SectionLabel>
+
+        <FieldRow>
+          <div>
+            <FieldLabel htmlFor="kc-record-full-res-toggle">Record at full resolution</FieldLabel>
+            <FieldHint>Recorded clips capture at full resolution regardless of on-screen size</FieldHint>
+          </div>
+          <input
+            id="kc-record-full-res-toggle"
+            type="checkbox"
+            checked={recordFullResolution}
+            onChange={(e) => onRecordFullResolutionChange(e.target.checked)}
             style={{ accentColor: "var(--kc-accent)", width: "1rem", height: "1rem" }}
           />
         </FieldRow>

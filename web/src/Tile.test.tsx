@@ -20,6 +20,40 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Tile } from "./Tile";
 
+/*
+ * `recordFullResolution` threading test below needs to see WHAT CameraFeed's
+ * REC button passes to the store's start(), which the real RecordingController
+ * can't exercise under jsdom (no track-bearing MediaStream). Fake the hook at
+ * its resolved module path, same technique as recordingFlow.test.tsx, so
+ * CameraFeed (inside kerbcast-react) picks up the fake via its own relative
+ * import.
+ */
+const startSpy = vi.fn<(flightId: number, opts?: { forceFullResolution?: boolean }) => string>();
+
+vi.mock("../../client-sdk/react/src/hooks/useRecordings", async () => {
+  const { useState: useReactState } = await import("react");
+
+  function useRecordings() {
+    const [active] = useReactState<unknown[]>([]);
+    return {
+      recordings: [],
+      groups: [],
+      active,
+      isRecording: () => false,
+      start: (flightId: number, opts?: { forceFullResolution?: boolean }): string => {
+        return startSpy(flightId, opts);
+      },
+      stop: vi.fn(),
+      startGroup: vi.fn(),
+      stopGroup: vi.fn(),
+      discard: vi.fn(),
+      discardGroup: vi.fn(),
+    };
+  }
+
+  return { useRecordings };
+});
+
 function makeCamera(overrides: MockCameraInit): MockCameraInit {
   return {
     lifecycle: "active" as CameraLifecycle,
@@ -84,6 +118,7 @@ function renderTile(
     selectionMode?: boolean;
     selected?: boolean;
     onToggleSelect?: () => void;
+    recordFullResolution?: boolean;
   } = {},
 ) {
   return render(
@@ -93,6 +128,7 @@ function renderTile(
         index={0}
         showDebugInfo={false}
         showStatic={false}
+        recordFullResolution={opts.recordFullResolution ?? false}
         spotlit={false}
         // Default true (no filter) so existing part-cam tests are unchanged.
         mergeCrew={opts.mergeCrew ?? true}
@@ -283,6 +319,7 @@ describe("Tile - REC+ selection mode", () => {
             index={0}
             showDebugInfo={false}
             showStatic={false}
+            recordFullResolution={false}
             spotlit={false}
             mergeCrew={true}
             onSelectCamera={() => {}}
@@ -321,5 +358,33 @@ describe("Tile - per-feed recording", () => {
     await act(async () => { renderTile(client, 1); });
 
     expect(screen.getByRole("button", { name: /start recording/i })).toBeTruthy();
+  });
+
+  it("threads recordFullResolution through to CameraFeed's start call", async () => {
+    startSpy.mockReset();
+    const { client } = await buildConnectedFixture([
+      makeCamera({ flightId: 1, cameraName: "Alpha" }),
+    ]);
+    await act(async () => { renderTile(client, 1, { recordFullResolution: true }); });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /start recording/i }));
+    });
+
+    expect(startSpy).toHaveBeenCalledWith(1, { forceFullResolution: true });
+  });
+
+  it("defaults to forceFullResolution: false when recordFullResolution is off", async () => {
+    startSpy.mockReset();
+    const { client } = await buildConnectedFixture([
+      makeCamera({ flightId: 1, cameraName: "Alpha" }),
+    ]);
+    await act(async () => { renderTile(client, 1, { recordFullResolution: false }); });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /start recording/i }));
+    });
+
+    expect(startSpy).toHaveBeenCalledWith(1, { forceFullResolution: false });
   });
 });

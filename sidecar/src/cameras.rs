@@ -523,6 +523,13 @@ pub struct CameraState {
     /// this cap): a manual size can only LOWER what auto would pick, never raise
     /// it past what consumers actually need.
     pub manual_render_cap: Mutex<Option<(u32, u32)>>,
+    /// Peers currently forcing this camera to the ring ceiling (e.g. a
+    /// full-resolution recording), keyed by `peer_id`. OR-aggregated: forced
+    /// while ANY entry is present, released once the set is empty. Mirrors
+    /// `display_sizes` (per-peer, forgotten on unsubscribe / disconnect / peer
+    /// reap), not `effective_degrade` (a camera-global scalar): forcing is a
+    /// genuine per-consumer demand, not a camera-wide property.
+    pub forced_full_res: Mutex<std::collections::HashSet<u32>>,
 }
 
 impl CameraState {
@@ -668,14 +675,38 @@ impl CameraState {
         *self.manual_render_cap.lock().await = cap;
     }
 
-    /// Effective render size = min(auto MAX-across-consumers, manual cap),
-    /// clamped to the ring's max dims and made even (H.264 chroma). `None` when
-    /// there is neither a consumer demand nor a manual cap — the plugin then
-    /// falls back to its settings.cfg default. This is what gets written into
-    /// `ControlState.width/height`; the plugin's adaptive-shed min() still rides
-    /// underneath.
+    /// Force (or release) this camera to the ring ceiling for one peer, keyed
+    /// by `peer_id` (e.g. a full-resolution recording). OR-aggregated: see
+    /// `forced_full_res`.
+    pub async fn set_forced(&self, peer_id: u32, force: bool) {
+        let mut forced = self.forced_full_res.lock().await;
+        if force {
+            forced.insert(peer_id);
+        } else {
+            forced.remove(&peer_id);
+        }
+    }
+
+    /// Forget a peer's force (on unsubscribe / disconnect / peer reap) so the
+    /// OR relaxes once no peer still forces it. Returns whether an entry was
+    /// actually removed (so callers skip a redundant reflush).
+    pub async fn forget_forced(&self, peer_id: u32) -> bool {
+        self.forced_full_res.lock().await.remove(&peer_id)
+    }
+
+    /// Effective render size = min(demand, manual cap), clamped to the ring's
+    /// max dims and made even (H.264 chroma). Demand is normally the auto MAX-
+    /// across-consumers display size; while ANY peer forces this camera (see
+    /// `forced_full_res`), demand is instead the ring ceiling, so a forced feed
+    /// sizes up regardless of what's actually being displayed. `None` when
+    /// there is neither a consumer demand nor a manual cap nor a force: the
+    /// plugin then falls back to its settings.cfg default. This is what gets
+    /// written into `ControlState.width/height`; the plugin's adaptive-shed
+    /// min() still rides underneath (untouched by force).
     pub async fn effective_render_size(&self) -> Option<(u32, u32)> {
-        let auto = {
+        let auto = if !self.forced_full_res.lock().await.is_empty() {
+            Some((self.max_width, self.max_height))
+        } else {
             let sizes = self.display_sizes.lock().await;
             sizes
                 .values()
@@ -1156,6 +1187,7 @@ impl CameraRegistry {
                             tracks: RwLock::new(Vec::new()),
                             display_sizes: Mutex::new(std::collections::HashMap::new()),
                             manual_render_cap: Mutex::new(None),
+                            forced_full_res: Mutex::new(std::collections::HashSet::new()),
                             control: Mutex::new(ControlState::default()),
                             control_block: std::sync::Mutex::new(None),
                         }),
@@ -1730,6 +1762,39 @@ impl CameraRegistry {
         }
     }
 
+    /// A peer forced (or released) this camera to the ring ceiling: record it
+    /// (keyed by `peer_id`) and reflush the effective size. See
+    /// `SetForceFullResolution`.
+    pub async fn set_forced_full_res(&self, flight_id: u32, peer_id: u32, force: bool) {
+        match self.get(flight_id).await {
+            Some(cam) => cam.set_forced(peer_id, force).await,
+            None => return,
+        }
+        if let Err(e) = self.flush_effective_render_size(flight_id).await {
+            warn!(flight_id, error = %e, "force-full-res flush failed");
+        }
+    }
+
+    /// Forget a peer's force across EVERY camera, reflushing the ones that
+    /// held the key. Peer-scoped for the same reason as
+    /// `forget_display_size_all`: a force can exist for a camera the peer
+    /// never bound a slot to, so a binding-scoped clear would leak it forever.
+    /// Called on graceful Disconnect and in the dead-peer reaper.
+    pub async fn forget_forced_all(&self, peer_id: u32) {
+        let flight_ids: Vec<u32> = self.cameras.read().await.keys().copied().collect();
+        for flight_id in flight_ids {
+            let removed = match self.get(flight_id).await {
+                Some(cam) => cam.forget_forced(peer_id).await,
+                None => continue,
+            };
+            if removed {
+                if let Err(e) = self.flush_effective_render_size(flight_id).await {
+                    warn!(flight_id, error = %e, "force-full-res forget-all flush failed");
+                }
+            }
+        }
+    }
+
     /// Operator `SetRenderSize`: set (or clear) the manual cap and reflush the
     /// effective size (min(auto, cap)).
     pub async fn set_manual_render_size(
@@ -2288,6 +2353,98 @@ mod tests {
         // Clearing the cap frees it back to the auto max.
         cam.set_manual_render_cap(None).await;
         assert_eq!(cam.effective_render_size().await, Some((512, 512)));
+    }
+
+    /// A forced feed sizes to the ring ceiling regardless of demand: even the
+    /// only reported display size being tiny doesn't shrink it back down.
+    #[tokio::test]
+    async fn forced_full_res_sizes_to_the_ceiling_over_tiny_demand() {
+        let (_dir, cam) = attach_camera_for_tracker(7_005).await;
+        cam.record_display_size(1, 40, 40).await;
+        assert_eq!(cam.effective_render_size().await, Some((40, 40)));
+
+        cam.set_forced(1, true).await;
+        assert_eq!(
+            cam.effective_render_size().await,
+            Some((1024, 1024)),
+            "forcing must size to the ring ceiling, not the tiny display demand"
+        );
+    }
+
+    /// Force is OR-aggregated across peers: still forced while ANY peer holds
+    /// it, released only once the last one clears (mirrors the display-size
+    /// MAX-across-consumers relax-on-departure shape, but with an OR instead
+    /// of a MAX).
+    #[tokio::test]
+    async fn forced_full_res_or_aggregates_across_peers() {
+        let (_dir, cam) = attach_camera_for_tracker(7_006).await;
+        cam.record_display_size(1, 40, 40).await;
+
+        cam.set_forced(1, true).await;
+        cam.set_forced(2, true).await;
+        assert_eq!(cam.effective_render_size().await, Some((1024, 1024)));
+
+        cam.set_forced(1, false).await;
+        assert_eq!(
+            cam.effective_render_size().await,
+            Some((1024, 1024)),
+            "still forced while peer 2 holds it"
+        );
+
+        cam.set_forced(2, false).await;
+        assert_eq!(
+            cam.effective_render_size().await,
+            Some((40, 40)),
+            "released back to demand once every peer clears"
+        );
+    }
+
+    /// `forget_forced_all(peer_id)` sweeps every camera, mirroring
+    /// `forget_display_size_all`: a peer disconnecting must not leave a
+    /// force pinned on a camera it forgot to explicitly release.
+    #[tokio::test]
+    async fn forget_forced_all_sweeps_every_camera_for_the_peer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shm = dir.path();
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 1024,
+            max_height: 1024,
+        };
+        for id in [7_201u32, 7_202u32] {
+            MmapFrameRing::create(&shm.join(format!("{id}.ring")), cfg).expect("create ring");
+        }
+        let registry = CameraRegistry::new(shm.to_path_buf());
+        registry.rescan().await;
+        let cam_a = registry.get(7_201).await.expect("cam a");
+        let cam_b = registry.get(7_202).await.expect("cam b");
+
+        cam_a.set_forced(1, true).await;
+        cam_b.set_forced(1, true).await;
+        assert_eq!(cam_a.effective_render_size().await, Some((1024, 1024)));
+        assert_eq!(cam_b.effective_render_size().await, Some((1024, 1024)));
+
+        registry.forget_forced_all(1).await;
+        assert_eq!(
+            cam_a.effective_render_size().await,
+            None,
+            "peer sweep must clear the force on every camera it touched"
+        );
+        assert_eq!(cam_b.effective_render_size().await, None);
+    }
+
+    /// Regression: an unforced feed's effective size is unaffected by the
+    /// force branch existing at all.
+    #[tokio::test]
+    async fn unforced_feed_is_unchanged() {
+        let (_dir, cam) = attach_camera_for_tracker(7_007).await;
+        assert_eq!(cam.effective_render_size().await, None);
+
+        cam.record_display_size(1, 512, 512).await;
+        assert_eq!(cam.effective_render_size().await, Some((512, 512)));
+
+        cam.set_manual_render_cap(Some((256, 256))).await;
+        assert_eq!(cam.effective_render_size().await, Some((256, 256)));
     }
 
     /// A kerbal-camera manifest (`kind:"kerbal"`, a persistent id, a crew

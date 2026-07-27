@@ -20,6 +20,7 @@ const KEY_CREW_BAR_PLACEMENT = "kerbcast:crewBarPlacement";
 const KEY_CREW_MERGE = "kerbcast:crewBarDissolve";
 const KEY_CREW_CLOSED = "kerbcast:crewClosed";
 const KEY_CREW_SPOTLIGHT = "kerbcast:crewSpotlight";
+const KEY_RECORD_FULL_RESOLUTION = "kerbcast:recordFullResolution";
 
 export function loadTheme(): ThemePreference {
   const raw = localStorage.getItem(KEY_THEME);
@@ -145,4 +146,17 @@ export function saveCrewSpotlight(flightId: number | null): void {
   } catch {
     // ignore (private browsing / storage full)
   }
+}
+
+/**
+ * Record-at-full-resolution preference: the persisted default for single-feed
+ * REC and the seed for the REC+ group banner's own checkbox. Defaults to
+ * false (unset) so a clip is display-size sized unless the operator opts in.
+ */
+export function loadRecordFullResolution(): boolean {
+  return localStorage.getItem(KEY_RECORD_FULL_RESOLUTION) === "true";
+}
+
+export function saveRecordFullResolution(enabled: boolean): void {
+  localStorage.setItem(KEY_RECORD_FULL_RESOLUTION, String(enabled));
 }

@@ -21,7 +21,7 @@ interface FakeActive {
   groupId?: string;
 }
 
-const startGroupSpy = vi.fn<(flightIds: number[]) => string>();
+const startGroupSpy = vi.fn<(flightIds: number[], opts?: { forceFullResolution?: boolean }) => string>();
 const stopGroupSpy = vi.fn<(groupId: string) => Promise<unknown>>();
 
 /* Matches RecGroupBar's own nowMs(): performance.now() when available, same
@@ -47,8 +47,8 @@ vi.mock("@ksp-gonogo/kerbcast-react", async (importOriginal) => {
       isRecording: () => false,
       start: vi.fn(),
       stop: vi.fn(),
-      startGroup: (flightIds: number[]): string => {
-        const groupId = startGroupSpy(flightIds);
+      startGroup: (flightIds: number[], opts?: { forceFullResolution?: boolean }): string => {
+        const groupId = startGroupSpy(flightIds, opts);
         setActive(
           flightIds.map((flightId, i) => ({
             recordingId: `rec-${i}`,
@@ -150,8 +150,176 @@ describe("RecGroupBar - selecting", () => {
     act(() => {
       fireEvent.click(screen.getByRole("button", { name: /start grouped recording/i }));
     });
-    expect(startGroupSpy).toHaveBeenCalledWith([3, 5]);
+    expect(startGroupSpy).toHaveBeenCalledWith([3, 5], { forceFullResolution: false });
     expect(onStarted).toHaveBeenCalledWith("grp-1");
+  });
+});
+
+describe("RecGroupBar - full resolution checkbox", () => {
+  it("is unchecked by default (no defaultFullResolution prop)", () => {
+    render(
+      <RecGroupBar
+        active={true}
+        selectedFlightIds={new Set([1])}
+        groupId={null}
+        onCancel={() => {}}
+        onStarted={() => {}}
+        onStopped={() => {}}
+      />,
+    );
+    const cb = screen.getByRole("checkbox", { name: /full resolution/i }) as HTMLInputElement;
+    expect(cb.checked).toBe(false);
+  });
+
+  it("seeds checked from defaultFullResolution", () => {
+    render(
+      <RecGroupBar
+        active={true}
+        selectedFlightIds={new Set([1])}
+        groupId={null}
+        defaultFullResolution={true}
+        onCancel={() => {}}
+        onStarted={() => {}}
+        onStopped={() => {}}
+      />,
+    );
+    const cb = screen.getByRole("checkbox", { name: /full resolution/i }) as HTMLInputElement;
+    expect(cb.checked).toBe(true);
+  });
+
+  it("passes the seeded (unticked) default through to startGroup", () => {
+    render(
+      <RecGroupBar
+        active={true}
+        selectedFlightIds={new Set([3, 5])}
+        groupId={null}
+        defaultFullResolution={true}
+        onCancel={() => {}}
+        onStarted={() => {}}
+        onStopped={() => {}}
+      />,
+    );
+    act(() => {
+      fireEvent.click(screen.getByRole("button", { name: /start grouped recording/i }));
+    });
+    expect(startGroupSpy).toHaveBeenCalledWith([3, 5], { forceFullResolution: true });
+  });
+
+  it("does not re-seed the checkbox when defaultFullResolution changes mid-selection", () => {
+    const { rerender } = render(
+      <RecGroupBar
+        active={true}
+        selectedFlightIds={new Set([1])}
+        groupId={null}
+        defaultFullResolution={false}
+        onCancel={() => {}}
+        onStarted={() => {}}
+        onStopped={() => {}}
+      />,
+    );
+    const cb = screen.getByRole("checkbox", { name: /full resolution/i }) as HTMLInputElement;
+    expect(cb.checked).toBe(false);
+
+    /* Manual override: the operator ticks the box for this selection. */
+    fireEvent.click(cb);
+    expect(cb.checked).toBe(true);
+
+    /* Settings changes the default while selection stays open (both panels
+       can be open at once). The banner's checkbox must keep the manual
+       override, not silently reset to the new default. */
+    rerender(
+      <RecGroupBar
+        active={true}
+        selectedFlightIds={new Set([1])}
+        groupId={null}
+        defaultFullResolution={true}
+        onCancel={() => {}}
+        onStarted={() => {}}
+        onStopped={() => {}}
+      />,
+    );
+    expect(cb.checked).toBe(true);
+
+    rerender(
+      <RecGroupBar
+        active={true}
+        selectedFlightIds={new Set([1])}
+        groupId={null}
+        defaultFullResolution={false}
+        onCancel={() => {}}
+        onStarted={() => {}}
+        onStopped={() => {}}
+      />,
+    );
+    expect(cb.checked).toBe(true);
+  });
+
+  it("re-seeds from the (new) default on re-entering selection mode", () => {
+    const { rerender } = render(
+      <RecGroupBar
+        active={true}
+        selectedFlightIds={new Set([1])}
+        groupId={null}
+        defaultFullResolution={false}
+        onCancel={() => {}}
+        onStarted={() => {}}
+        onStopped={() => {}}
+      />,
+    );
+    fireEvent.click(screen.getByRole("checkbox", { name: /full resolution/i }));
+    expect(
+      (screen.getByRole("checkbox", { name: /full resolution/i }) as HTMLInputElement).checked,
+    ).toBe(true);
+
+    /* Leave selection mode. */
+    rerender(
+      <RecGroupBar
+        active={false}
+        selectedFlightIds={new Set()}
+        groupId={null}
+        defaultFullResolution={false}
+        onCancel={() => {}}
+        onStarted={() => {}}
+        onStopped={() => {}}
+      />,
+    );
+
+    /* Settings changes the default while selection is closed. */
+    /* Re-enter selection with the new default: the checkbox should re-seed
+       from it, not carry over the discarded prior override. */
+    rerender(
+      <RecGroupBar
+        active={true}
+        selectedFlightIds={new Set([1])}
+        groupId={null}
+        defaultFullResolution={true}
+        onCancel={() => {}}
+        onStarted={() => {}}
+        onStopped={() => {}}
+      />,
+    );
+    expect(
+      (screen.getByRole("checkbox", { name: /full resolution/i }) as HTMLInputElement).checked,
+    ).toBe(true);
+  });
+
+  it("toggling the checkbox overrides the default and is forwarded to startGroup", () => {
+    render(
+      <RecGroupBar
+        active={true}
+        selectedFlightIds={new Set([3, 5])}
+        groupId={null}
+        defaultFullResolution={false}
+        onCancel={() => {}}
+        onStarted={() => {}}
+        onStopped={() => {}}
+      />,
+    );
+    fireEvent.click(screen.getByRole("checkbox", { name: /full resolution/i }));
+    act(() => {
+      fireEvent.click(screen.getByRole("button", { name: /start grouped recording/i }));
+    });
+    expect(startGroupSpy).toHaveBeenCalledWith([3, 5], { forceFullResolution: true });
   });
 });
 

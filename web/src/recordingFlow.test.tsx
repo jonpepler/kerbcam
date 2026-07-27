@@ -58,6 +58,10 @@ const fakeStore = vi.hoisted(() => {
       : Date.now();
   }
 
+  interface StartOpts {
+    forceFullResolution?: boolean;
+  }
+
   class FakeRecordingsStore {
     private state: { recordings: FakeHandle[]; groups: FakeGroupHandle[]; active: FakeActive[] } = {
       recordings: [],
@@ -66,6 +70,16 @@ const fakeStore = vi.hoisted(() => {
     };
     private listeners = new Set<() => void>();
     private counter = 0;
+    /**
+     * Every `start`/`startGroup` call, in order, with whatever options the
+     * caller passed. Lets a test assert which surface (Settings toggle vs
+     * REC+ banner checkbox) drove `forceFullResolution` without needing a
+     * real RecordingController (see the "option wiring" describe blocks
+     * below; the resulting arm/bump/trim behavior itself is covered by
+     * mockForceFullResolution.test.ts against the real controller and mock).
+     */
+    readonly startCalls: { flightId: number; opts?: StartOpts }[] = [];
+    readonly startGroupCalls: { flightIds: number[]; opts?: StartOpts }[] = [];
 
     subscribe = (fn: () => void): (() => void) => {
       this.listeners.add(fn);
@@ -95,7 +109,8 @@ const fakeStore = vi.hoisted(() => {
       return this.state.active.some((a) => a.flightId === flightId);
     }
 
-    start(flightId: number): string {
+    start(flightId: number, opts?: StartOpts): string {
+      this.startCalls.push({ flightId, opts });
       const id = `rec-${++this.counter}`;
       this.set({
         ...this.state,
@@ -114,7 +129,8 @@ const fakeStore = vi.hoisted(() => {
       return handle;
     }
 
-    startGroup(flightIds: number[]): string {
+    startGroup(flightIds: number[], opts?: StartOpts): string {
+      this.startGroupCalls.push({ flightIds, opts });
       const groupId = `grp-${++this.counter}`;
       const active = flightIds.map((flightId) => ({
         recordingId: `rec-${++this.counter}`,
@@ -150,6 +166,8 @@ const fakeStore = vi.hoisted(() => {
       this.state = { recordings: [], groups: [], active: [] };
       this.listeners.clear();
       this.counter = 0;
+      this.startCalls.length = 0;
+      this.startGroupCalls.length = 0;
     }
   }
 
@@ -177,9 +195,11 @@ vi.mock("../../client-sdk/react/src/hooks/useRecordings", async () => {
       groups: snapshot.groups,
       active: snapshot.active,
       isRecording: (flightId: number) => fakeStore.isRecording(flightId),
-      start: (flightId: number) => fakeStore.start(flightId),
+      start: (flightId: number, opts?: { forceFullResolution?: boolean }) =>
+        fakeStore.start(flightId, opts),
       stop: (id: string) => fakeStore.stop(id),
-      startGroup: (flightIds: number[]) => fakeStore.startGroup(flightIds),
+      startGroup: (flightIds: number[], opts?: { forceFullResolution?: boolean }) =>
+        fakeStore.startGroup(flightIds, opts),
       stopGroup: (groupId: string) => fakeStore.stopGroup(groupId),
       discard: (id: string) => fakeStore.discard(id),
       discardGroup: (id: string) => fakeStore.discardGroup(id),
@@ -313,7 +333,9 @@ describe("recording flow - REC+ grouped", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /rec\+/i }));
 
-    const checkboxes = screen.getAllByRole("checkbox");
+    // Tile selection checkboxes only, distinct from the banner's own "Full
+    // resolution" checkbox.
+    const checkboxes = screen.getAllByRole("checkbox", { name: /select tile/i });
     expect(checkboxes).toHaveLength(2);
     fireEvent.click(checkboxes[0]);
     fireEvent.click(checkboxes[1]);
@@ -350,11 +372,102 @@ describe("recording flow - REC+ grouped", () => {
     });
 
     fireEvent.click(screen.getByRole("button", { name: /rec\+/i }));
-    fireEvent.click(screen.getAllByRole("checkbox")[0]);
+    fireEvent.click(screen.getAllByRole("checkbox", { name: /select tile/i })[0]);
     fireEvent.click(screen.getByRole("button", { name: /^cancel$/i }));
 
     expect(screen.queryAllByRole("checkbox")).toHaveLength(0);
     expect(screen.queryByText(/recording \d feeds/i)).toBeNull();
     expect(screen.queryAllByLabelText("Recording")).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Full-resolution option wiring: the Settings toggle governs the single-feed
+// REC button; the REC+ banner checkbox governs the grouped recording. Only
+// the wiring (which `forceFullResolution` value reaches the store) is
+// asserted here, via the fake store's recorded `startCalls`/`startGroupCalls`.
+// The resulting arm/bump/trim behavior against the real controller and real
+// mock is covered separately in mockForceFullResolution.test.ts.
+// ---------------------------------------------------------------------------
+
+describe("recording flow - full resolution option wiring", () => {
+  it("the Settings toggle governs the single-feed REC button", async () => {
+    await renderAppWithCameras([makeCamera({ flightId: 1, cameraName: "Alpha" })]);
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /remove tile 1/i })).toBeTruthy();
+    });
+
+    // Default (off): starting REC sends forceFullResolution: false.
+    fireEvent.click(screen.getByRole("button", { name: /start recording/i }));
+    expect(fakeStore.startCalls.at(-1)).toMatchObject({
+      flightId: 1,
+      opts: { forceFullResolution: false },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /stop recording/i }));
+
+    // Turn the setting on, then start again: forceFullResolution: true.
+    fireEvent.click(screen.getByRole("button", { name: /settings/i }));
+    await waitFor(() => {
+      expect(screen.getByRole("dialog", { name: /settings/i })).toBeTruthy();
+    });
+    fireEvent.click(screen.getByLabelText(/record at full resolution/i));
+    fireEvent.click(screen.getByRole("button", { name: /close/i }));
+
+    fireEvent.click(screen.getByRole("button", { name: /start recording/i }));
+    expect(fakeStore.startCalls.at(-1)).toMatchObject({
+      flightId: 1,
+      opts: { forceFullResolution: true },
+    });
+  });
+
+  it("the REC+ banner checkbox governs the grouped recording, independent of the Settings default", async () => {
+    await renderAppWithCameras([
+      makeCamera({ flightId: 1, cameraName: "Alpha" }),
+      makeCamera({ flightId: 2, cameraName: "Bravo" }),
+    ]);
+    await waitFor(() => {
+      expect(screen.getAllByRole("button", { name: /remove tile/i })).toHaveLength(2);
+    });
+
+    // Settings default is off; the banner checkbox starts unticked to match.
+    fireEvent.click(screen.getByRole("button", { name: /rec\+/i }));
+    const checkbox = screen.getByLabelText(/full resolution/i) as HTMLInputElement;
+    expect(checkbox.checked).toBe(false);
+
+    fireEvent.click(checkbox);
+    fireEvent.click(screen.getAllByRole("checkbox", { name: /select tile/i })[0]);
+    fireEvent.click(screen.getAllByRole("checkbox", { name: /select tile/i })[1]);
+    fireEvent.click(screen.getByRole("button", { name: /start grouped recording/i }));
+
+    expect(fakeStore.startGroupCalls.at(-1)).toMatchObject({
+      flightIds: [1, 2],
+      opts: { forceFullResolution: true },
+    });
+  });
+
+  it("seeds the REC+ banner checkbox from the Settings default when re-entering selection mode", async () => {
+    await renderAppWithCameras([
+      makeCamera({ flightId: 1, cameraName: "Alpha" }),
+      makeCamera({ flightId: 2, cameraName: "Bravo" }),
+    ]);
+    await waitFor(() => {
+      expect(screen.getAllByRole("button", { name: /remove tile/i })).toHaveLength(2);
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /settings/i }));
+    await waitFor(() => {
+      expect(screen.getByRole("dialog", { name: /settings/i })).toBeTruthy();
+    });
+    fireEvent.click(screen.getByLabelText(/record at full resolution/i));
+    fireEvent.click(screen.getByRole("button", { name: /close/i }));
+
+    fireEvent.click(screen.getByRole("button", { name: /rec\+/i }));
+    const checkbox = screen.getByLabelText(/full resolution/i) as HTMLInputElement;
+    expect(checkbox.checked).toBe(true);
+
+    fireEvent.click(screen.getAllByRole("checkbox", { name: /select tile/i })[0]);
+    fireEvent.click(screen.getByRole("button", { name: /start grouped recording/i }));
+
+    expect(fakeStore.startGroupCalls.at(-1)?.opts).toEqual({ forceFullResolution: true });
   });
 });

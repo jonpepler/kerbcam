@@ -11,7 +11,7 @@
  */
 
 import { formatElapsed, nowMs, useRecordings } from "@ksp-gonogo/kerbcast-react";
-import { useEffect, useReducer } from "react";
+import { useEffect, useReducer, useRef, useState } from "react";
 import styled from "styled-components";
 
 export interface RecGroupBarProps {
@@ -20,6 +20,8 @@ export interface RecGroupBarProps {
   selectedFlightIds: ReadonlySet<number>;
   /** The in-progress grouped recording's id, or null when none is running. */
   groupId: string | null;
+  /** Seeds the banner's own "Full resolution" checkbox (the Settings default). */
+  defaultFullResolution?: boolean;
   onCancel: () => void;
   onStarted: (groupId: string) => void;
   onStopped: () => void;
@@ -29,11 +31,23 @@ export function RecGroupBar({
   active,
   selectedFlightIds,
   groupId,
+  defaultFullResolution = false,
   onCancel,
   onStarted,
   onStopped,
 }: RecGroupBarProps): React.JSX.Element | null {
   const recordings = useRecordings();
+  /* Local, per-selection override of the Settings default; re-seeded only on
+     ENTRY into selection mode (the active false->true transition), not on
+     every defaultFullResolution change, so a Settings edit made while
+     selection is already open (both panels can be open at once) doesn't
+     silently discard a manual override of the checkbox. */
+  const [fullResolution, setFullResolution] = useState(defaultFullResolution);
+  const wasActive = useRef(active);
+  useEffect(() => {
+    if (active && !wasActive.current) setFullResolution(defaultFullResolution);
+    wasActive.current = active;
+  }, [active, defaultFullResolution]);
 
   const members = groupId
     ? recordings.active.filter((a) => a.groupId === groupId)
@@ -89,6 +103,16 @@ export function RecGroupBar({
             ? "Select feeds to record together"
             : `${count} feed${count === 1 ? "" : "s"} selected`}
         </Label>
+        <FullResLabel htmlFor="kc-rec-group-full-res">
+          <input
+            id="kc-rec-group-full-res"
+            type="checkbox"
+            checked={fullResolution}
+            onChange={(e) => setFullResolution(e.target.checked)}
+            style={{ accentColor: "var(--kc-accent)", width: "1rem", height: "1rem" }}
+          />
+          Full resolution
+        </FullResLabel>
         <Spacer />
         <BarButton type="button" onClick={onCancel}>
           Cancel
@@ -98,7 +122,9 @@ export function RecGroupBar({
           $primary
           disabled={count === 0}
           onClick={() => {
-            const groupId = recordings.startGroup([...selectedFlightIds]);
+            const groupId = recordings.startGroup([...selectedFlightIds], {
+              forceFullResolution: fullResolution,
+            });
             onStarted(groupId);
           }}
         >
@@ -147,6 +173,16 @@ const Label = styled.span`
   font-size: 0.78rem;
   letter-spacing: 0.01em;
   color: var(--kc-text);
+`;
+
+const FullResLabel = styled.label`
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.78rem;
+  letter-spacing: 0.01em;
+  color: var(--kc-text-muted);
+  cursor: pointer;
 `;
 
 const Spacer = styled.div`

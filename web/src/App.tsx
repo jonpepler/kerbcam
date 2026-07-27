@@ -22,6 +22,7 @@ import {
   loadCrewMerge,
   loadCrewSpotlight,
   loadDebug,
+  loadRecordFullResolution,
   loadShowPerfWarnings,
   loadShowStatic,
   loadTheme,
@@ -30,6 +31,7 @@ import {
   saveCrewMerge,
   saveCrewSpotlight,
   saveDebug,
+  saveRecordFullResolution,
   saveShowPerfWarnings,
   saveShowStatic,
   saveTheme,
@@ -83,6 +85,9 @@ export function App({ client }: AppProps): React.JSX.Element {
       ? showStaticExplicit
       : !window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   const [showPerfWarnings, setShowPerfWarnings] = useState<boolean>(() => loadShowPerfWarnings());
+  const [recordFullResolution, setRecordFullResolution] = useState<boolean>(
+    () => loadRecordFullResolution(),
+  );
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [recordingsOpen, setRecordingsOpen] = useState(false);
   const toggleSettings = useCallback(() => {
@@ -198,12 +203,14 @@ export function App({ client }: AppProps): React.JSX.Element {
             debug={debug}
             showStatic={showStatic}
             showPerfWarnings={showPerfWarnings}
+            recordFullResolution={recordFullResolution}
             crewPlacement={crewPlacement}
             crewMerge={crewMerge}
             onThemeChange={(t: ThemePreference) => { saveTheme(t); applyTheme(t); setTheme(t); }}
             onDebugChange={(d: boolean) => { saveDebug(d); setDebug(d); }}
             onShowStaticChange={(s: boolean) => { saveShowStatic(s); setShowStaticExplicit(s); }}
             onShowPerfWarningsChange={(v: boolean) => { saveShowPerfWarnings(v); setShowPerfWarnings(v); }}
+            onRecordFullResolutionChange={(v: boolean) => { saveRecordFullResolution(v); setRecordFullResolution(v); }}
             onCrewPlacementChange={(p: CrewBarPlacement) => { saveCrewBarPlacement(p); setCrewPlacement(p); }}
             onCrewMergeChange={(m: boolean) => { saveCrewMerge(m); setCrewMerge(m); }}
             onClose={() => setSettingsOpen(false)}
@@ -214,6 +221,7 @@ export function App({ client }: AppProps): React.JSX.Element {
           active={recSelectMode}
           selectedFlightIds={selectedFlightIds}
           groupId={activeGroupId}
+          defaultFullResolution={recordFullResolution}
           onCancel={cancelRecSelection}
           onStarted={handleGroupStarted}
           onStopped={handleGroupStopped}
@@ -246,6 +254,7 @@ export function App({ client }: AppProps): React.JSX.Element {
                 onTilesChange={setTiles}
                 showDebugInfo={debug}
                 showStatic={showStatic}
+                recordFullResolution={recordFullResolution}
                 selectionMode={recSelectMode}
                 selectedFlightIds={selectedFlightIds}
                 onToggleSelect={toggleTileSelected}

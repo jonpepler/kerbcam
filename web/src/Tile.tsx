@@ -25,6 +25,8 @@ interface TileProps {
   showDebugInfo: boolean;
   /** Whether to show animated static (true) or frozen frame with badge (false). */
   showStatic: boolean;
+  /** Whether this feed's own REC button records at full resolution. */
+  recordFullResolution: boolean;
   spotlit: boolean;
   variant?: TileVariant;
   /** True when any tile is spotlit (drives spotlight grid placement). */
@@ -49,6 +51,7 @@ export function Tile({
   index,
   showDebugInfo,
   showStatic,
+  recordFullResolution,
   spotlit,
   variant = "grid",
   spotlightActive = false,
@@ -208,6 +211,7 @@ export function Tile({
           flightId={flightId}
           showDebugInfo={showDebugInfo}
           showStatic={showStatic}
+          recordFullResolution={recordFullResolution}
           showStandbyIcon={false}
           onSelectCamera={onSelectCamera}
           cameraFilter={mergeCrew ? undefined : (c) => c.kind === CameraKind.Part}

@@ -10,7 +10,9 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { CameraState } from "./__generated__/types";
 import {
+  ARM_TIMEOUT_MS,
   RecordingController,
   commonUtWindow,
   createMediabunnyTrimmerLoader,
@@ -18,6 +20,7 @@ import {
   utToRecordingTimeMs,
   type GroupTrimmer,
   type RecordingClient,
+  type RecordingClientCamera,
   type RecordingHandle,
   type RecordingsSnapshot,
 } from "./recording";
@@ -93,6 +96,88 @@ function liveStream(): MediaStream {
 }
 
 /**
+ * Minimal `CameraState` fixture with every required field filled in with a
+ * plausible default; override just the fields a test cares about (usually
+ * `renderWidth`/`renderHeight`/`operatorWidth`/`operatorHeight`).
+ */
+function makeCameraState(overrides: Partial<CameraState> = {}): CameraState {
+  return {
+    flightId: 0,
+    partName: "part",
+    partTitle: "Part",
+    cameraName: "cam",
+    vesselName: "Vessel",
+    layers: [],
+    operatorLayers: [],
+    renderWidth: 320,
+    renderHeight: 240,
+    operatorWidth: 320,
+    operatorHeight: 240,
+    supportsZoom: false,
+    fov: 60,
+    fovMin: 10,
+    fovMax: 90,
+    supportsPan: false,
+    panYaw: 0,
+    panPitch: 0,
+    panYawMin: 0,
+    panYawMax: 0,
+    panPitchMin: 0,
+    panPitchMax: 0,
+    encoderBitrateBps: 0,
+    targetBitrateBps: 0,
+    degradeLevel: 0,
+    ...overrides,
+  };
+}
+
+/**
+ * A per-flight camera fake: a settable `mediaStream`/`maxRenderSize`, a
+ * `setForceFullResolution` call log, and an `emitState` test hook that
+ * mirrors a live `camera-state-changed` push (mutates `state`, notifies
+ * `on("change")` subscribers). Stable per flightId across repeated
+ * `client.camera(flightId)` calls, as the real client's handle is.
+ */
+class FakeCamera implements RecordingClientCamera {
+  mediaStream: MediaStream | null;
+  state: CameraState | null = null;
+  maxRenderSize: { width: number; height: number } | null = null;
+  readonly forceCalls: boolean[] = [];
+  /** When > 0, the next N calls to setForceFullResolution reject instead of
+   * resolving (consumed one per call), to simulate a dropped send. */
+  forceRejectCount = 0;
+  private readonly listeners = new Set<(state: CameraState) => void>();
+
+  constructor(stream: MediaStream | null) {
+    this.mediaStream = stream;
+  }
+
+  async setForceFullResolution(force: boolean): Promise<void> {
+    this.forceCalls.push(force);
+    if (this.forceRejectCount > 0) {
+      this.forceRejectCount -= 1;
+      throw new Error("simulated setForceFullResolution failure");
+    }
+  }
+
+  on(_event: "change", handler: (state: CameraState) => void): () => void {
+    this.listeners.add(handler);
+    return () => this.listeners.delete(handler);
+  }
+
+  /** Test hook: push a new state and notify subscribers. */
+  emitState(state: CameraState): void {
+    this.state = state;
+    for (const l of [...this.listeners]) l(state);
+  }
+
+  /** Live "change" subscription count, to assert a wait releases its listener. */
+  get changeListenerCount(): number {
+    return this.listeners.size;
+  }
+}
+
+/**
  * Minimal RecordingClient: a settable global capture clock and a per-flight
  * media stream. `tick(ut)` sets the clock and fires settings-change, modelling
  * the sidecar's ~1Hz push.
@@ -100,14 +185,22 @@ function liveStream(): MediaStream {
 class FakeRecordingClient implements RecordingClient {
   captureUt: number | null = null;
   private readonly streams = new Map<number, MediaStream | null>();
+  private readonly cams = new Map<number, FakeCamera>();
   private readonly listeners = new Set<(data: unknown) => void>();
 
   setStream(flightId: number, stream: MediaStream | null): void {
     this.streams.set(flightId, stream);
+    const cam = this.cams.get(flightId);
+    if (cam) cam.mediaStream = stream;
   }
 
-  camera(flightId: number): { readonly mediaStream: MediaStream | null } {
-    return { mediaStream: this.streams.get(flightId) ?? null };
+  camera(flightId: number): FakeCamera {
+    let cam = this.cams.get(flightId);
+    if (!cam) {
+      cam = new FakeCamera(this.streams.get(flightId) ?? null);
+      this.cams.set(flightId, cam);
+    }
+    return cam;
   }
 
   get clock(): { readonly captureUt: number | null } {
@@ -332,6 +425,532 @@ describe("RecordingController per-feed", () => {
       (globalThis as { MediaRecorder?: unknown }).MediaRecorder = original;
       DeferredStubMediaRecorder.pendingStops = [];
     }
+  });
+});
+
+describe("RecordingController force-full-resolution", () => {
+  let client: FakeRecordingClient;
+  let ctrl: RecordingController;
+  let trimCalls: { startMs: number; endMs: number; mimeType: string }[];
+  let fakeTrimmer: GroupTrimmer;
+
+  beforeEach(() => {
+    client = new FakeRecordingClient();
+    for (const flightId of [1, 2, 42, 43]) client.setStream(flightId, liveStream());
+    trimCalls = [];
+    fakeTrimmer = {
+      async trim(_blob, mimeType, startMs, endMs): Promise<Blob> {
+        trimCalls.push({ startMs, endMs, mimeType });
+        return new Blob([new Uint8Array(16)], { type: mimeType });
+      },
+    };
+    ctrl = new RecordingController(client, { loadTrimmer: () => Promise.resolve(fakeTrimmer) });
+  });
+
+  describe("single (arm-and-wait)", () => {
+    it("sends force and shows arming immediately", () => {
+      const cam = client.camera(42);
+      const id = ctrl.startRecording(42, { forceFullResolution: true });
+
+      expect(cam.forceCalls).toEqual([true]);
+      expect(ctrl.getSnapshot().active.find((a) => a.recordingId === id)?.arming).toBe(true);
+    });
+
+    it("delays recorder.start() until the feed reaches full resolution, ignoring a stale pre-force snapshot (pitfall 1)", async () => {
+      const cam = client.camera(42);
+      cam.maxRenderSize = { width: 1920, height: 1080 };
+      cam.emitState(
+        makeCameraState({
+          flightId: 42,
+          renderWidth: 160,
+          renderHeight: 120,
+          operatorWidth: 160,
+          operatorHeight: 120,
+        }),
+      );
+
+      const id = ctrl.startRecording(42, { forceFullResolution: true });
+      expect(ctrl.getSnapshot().active.find((a) => a.recordingId === id)?.arming).toBe(true);
+
+      /* A stray broadcast still reflecting the pre-force (small) size must
+         not be mistaken for readiness. */
+      cam.emitState(
+        makeCameraState({
+          flightId: 42,
+          renderWidth: 160,
+          renderHeight: 120,
+          operatorWidth: 160,
+          operatorHeight: 120,
+        }),
+      );
+      await flush();
+      expect(ctrl.getSnapshot().active.find((a) => a.recordingId === id)?.arming).toBe(true);
+
+      /* The genuine post-force broadcast: operator + render both at the
+         ceiling. */
+      cam.emitState(
+        makeCameraState({
+          flightId: 42,
+          renderWidth: 1920,
+          renderHeight: 1080,
+          operatorWidth: 1920,
+          operatorHeight: 1080,
+        }),
+      );
+      await flush();
+
+      expect(ctrl.getSnapshot().active.find((a) => a.recordingId === id)?.arming).toBe(false);
+      const handle = await ctrl.stopRecording(id);
+      /* The recorder actually started and captured frames. */
+      expect(handle.byteSize).toBeGreaterThan(0);
+    });
+
+    it("ignores a stray duplicate of the baseline size even when the ceiling is unknown to the client (pitfall 1, no maxRenderSize)", async () => {
+      const cam = client.camera(42);
+      cam.maxRenderSize = null;
+      cam.emitState(
+        makeCameraState({
+          flightId: 42,
+          renderWidth: 160,
+          renderHeight: 120,
+          operatorWidth: 160,
+          operatorHeight: 120,
+        }),
+      );
+
+      const id = ctrl.startRecording(42, { forceFullResolution: true });
+
+      /* Duplicate of the pre-force baseline: not an increase, must not ready. */
+      cam.emitState(
+        makeCameraState({
+          flightId: 42,
+          renderWidth: 160,
+          renderHeight: 120,
+          operatorWidth: 160,
+          operatorHeight: 120,
+        }),
+      );
+      await flush();
+      expect(ctrl.getSnapshot().active.find((a) => a.recordingId === id)?.arming).toBe(true);
+
+      /* A genuine increase past the baseline, caught up. */
+      cam.emitState(
+        makeCameraState({
+          flightId: 42,
+          renderWidth: 800,
+          renderHeight: 600,
+          operatorWidth: 800,
+          operatorHeight: 600,
+        }),
+      );
+      await flush();
+      expect(ctrl.getSnapshot().active.find((a) => a.recordingId === id)?.arming).toBe(false);
+    });
+
+    it("does not treat the first post-force broadcast as ready when no state was observed before watch-start (unknown ceiling, no prior discover())", async () => {
+      const cam = client.camera(42);
+      cam.maxRenderSize = null;
+      /* No emitState before startRecording: cam.state is genuinely null,
+         unlike the "stray duplicate" test above where a pre-force state was
+         already observed. This is the reachable no-discover() case: state
+         (data channel) and the track (RTP) are independent transports with
+         no ordering guarantee. */
+      expect(cam.state).toBeNull();
+
+      const id = ctrl.startRecording(42, { forceFullResolution: true });
+      expect(ctrl.getSnapshot().active.find((a) => a.recordingId === id)?.arming).toBe(true);
+
+      /* The FIRST state the client ever observes still reports the small
+         pre-force size. A {0,0} placeholder baseline would treat any
+         operatorWidth > 0 as "ready"; it must instead become the baseline. */
+      cam.emitState(
+        makeCameraState({
+          flightId: 42,
+          renderWidth: 160,
+          renderHeight: 120,
+          operatorWidth: 160,
+          operatorHeight: 120,
+        }),
+      );
+      await flush();
+      expect(ctrl.getSnapshot().active.find((a) => a.recordingId === id)?.arming).toBe(true);
+
+      /* A repeat of that same (now-baseline) size still must not ready. */
+      cam.emitState(
+        makeCameraState({
+          flightId: 42,
+          renderWidth: 160,
+          renderHeight: 120,
+          operatorWidth: 160,
+          operatorHeight: 120,
+        }),
+      );
+      await flush();
+      expect(ctrl.getSnapshot().active.find((a) => a.recordingId === id)?.arming).toBe(true);
+
+      /* A genuine increase past the established baseline, caught up. */
+      cam.emitState(
+        makeCameraState({
+          flightId: 42,
+          renderWidth: 800,
+          renderHeight: 600,
+          operatorWidth: 800,
+          operatorHeight: 600,
+        }),
+      );
+      await flush();
+      expect(ctrl.getSnapshot().active.find((a) => a.recordingId === id)?.arming).toBe(false);
+    });
+
+    it("starts promptly when the feed is already at its ceiling when forced (pitfall 2)", async () => {
+      const cam = client.camera(42);
+      cam.maxRenderSize = { width: 1920, height: 1080 };
+      cam.emitState(
+        makeCameraState({
+          flightId: 42,
+          renderWidth: 1920,
+          renderHeight: 1080,
+          operatorWidth: 1920,
+          operatorHeight: 1080,
+        }),
+      );
+
+      const id = ctrl.startRecording(42, { forceFullResolution: true });
+      /* Resolves on a microtask, not the multi-second arm timeout. */
+      await flush();
+
+      expect(ctrl.getSnapshot().active.find((a) => a.recordingId === id)?.arming).toBe(false);
+      const handle = await ctrl.stopRecording(id);
+      expect(handle.byteSize).toBeGreaterThan(0);
+    });
+
+    it("starts anyway after ARM_TIMEOUT_MS when the feed never reaches full resolution", async () => {
+      vi.useFakeTimers();
+      try {
+        const cam = client.camera(42);
+        cam.maxRenderSize = { width: 1920, height: 1080 };
+        cam.emitState(
+          makeCameraState({
+            flightId: 42,
+            renderWidth: 160,
+            renderHeight: 120,
+            operatorWidth: 160,
+            operatorHeight: 120,
+          }),
+        );
+
+        const id = ctrl.startRecording(42, { forceFullResolution: true });
+        expect(ctrl.getSnapshot().active.find((a) => a.recordingId === id)?.arming).toBe(true);
+
+        await vi.advanceTimersByTimeAsync(ARM_TIMEOUT_MS);
+
+        expect(ctrl.getSnapshot().active.find((a) => a.recordingId === id)?.arming).toBe(false);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  describe("grouped (record immediately)", () => {
+    it("starts every member's recorder immediately, without arming", () => {
+      const cam1 = client.camera(1);
+      const cam2 = client.camera(2);
+
+      const { recordingIds } = ctrl.startGroupedRecording([1, 2], {
+        forceFullResolution: true,
+      });
+
+      expect(cam1.forceCalls).toEqual([true]);
+      expect(cam2.forceCalls).toEqual([true]);
+      const active = ctrl.getSnapshot().active;
+      expect(active).toHaveLength(2);
+      expect(active.every((a) => a.arming === false)).toBe(true);
+      expect(recordingIds).toHaveLength(2);
+    });
+
+    it("captures each member's resolution-ready UT and folds it into the common trim window", async () => {
+      client.captureUt = 500;
+      /* maxRenderSize must be set BEFORE starting the group: watchResolutionReady
+         reads it synchronously at watch-start, so setting it afterwards would
+         silently exercise the (weaker) unknown-ceiling fallback instead of the
+         known-ceiling path this test is meant to cover. */
+      const cam1 = client.camera(1);
+      const cam2 = client.camera(2);
+      cam1.maxRenderSize = { width: 1920, height: 1080 };
+      cam2.maxRenderSize = { width: 1920, height: 1080 };
+      const { groupId, recordingIds } = ctrl.startGroupedRecording([1, 2], {
+        forceFullResolution: true,
+      });
+      const [id1, id2] = recordingIds;
+
+      /* Feed 1 reaches full resolution quickly. */
+      client.tick(502);
+      cam1.emitState(
+        makeCameraState({
+          flightId: 1,
+          renderWidth: 1920,
+          renderHeight: 1080,
+          operatorWidth: 1920,
+          operatorHeight: 1080,
+        }),
+      );
+      await flush();
+
+      /* Feed 2 reaches full resolution later; this later UT should win the fold. */
+      client.tick(506);
+      cam2.emitState(
+        makeCameraState({
+          flightId: 2,
+          renderWidth: 1920,
+          renderHeight: 1080,
+          operatorWidth: 1920,
+          operatorHeight: 1080,
+        }),
+      );
+      await flush();
+
+      client.captureUt = 510;
+      const handle = await ctrl.stopGroupedRecording(groupId);
+
+      expect(handle.commonUtWindow).toEqual([500, 510]);
+      expect(trimCalls).toHaveLength(2);
+
+      /* recordings/trimCalls preserve the [id1, id2] order Promise.all was
+         given, regardless of which member's trim settles first. */
+      const rec1 = handle.recordings.find((r) => r.recordingId === id1)!;
+      const rec2 = handle.recordings.find((r) => r.recordingId === id2)!;
+      const [call1, call2] = trimCalls;
+      /* The window start used is the LATEST resolution-ready UT (506), not
+         the raw common window start (500), for both clips alike (one common
+         window, UT-synced). */
+      expect(call1.startMs).toBe(utToRecordingTimeMs(rec1.utSamples, 506));
+      expect(call2.startMs).toBe(utToRecordingTimeMs(rec2.utSamples, 506));
+      /* Confirms the fold actually moved the start later than the untouched
+         common window would have. */
+      expect(call1.startMs).toBeGreaterThan(utToRecordingTimeMs(rec1.utSamples, 500)!);
+    });
+
+    it("leaves the lead-in untrimmed when no member ever reaches full resolution", async () => {
+      client.captureUt = 100;
+      const { groupId } = ctrl.startGroupedRecording([1, 2], { forceFullResolution: true });
+      client.captureUt = 105;
+      const handle = await ctrl.stopGroupedRecording(groupId);
+
+      expect(handle.commonUtWindow).toEqual([100, 105]);
+      expect(trimCalls).toHaveLength(2);
+      for (const call of trimCalls) {
+        expect(call.startMs).toBe(utToRecordingTimeMs(handle.recordings[0].utSamples, 100));
+      }
+    });
+  });
+
+  describe("release / ref-counting", () => {
+    it("releases force on stopRecording", async () => {
+      const cam = client.camera(42);
+      cam.maxRenderSize = { width: 320, height: 240 };
+      cam.emitState(makeCameraState({ flightId: 42 })); // matches the fixture's default (already "full")
+      const id = ctrl.startRecording(42, { forceFullResolution: true });
+      await flush();
+      await ctrl.stopRecording(id);
+      expect(cam.forceCalls).toEqual([true, false]);
+    });
+
+    it("releases force on discardRecording", async () => {
+      const cam = client.camera(42);
+      cam.maxRenderSize = { width: 320, height: 240 };
+      cam.emitState(makeCameraState({ flightId: 42 }));
+      const id = ctrl.startRecording(42, { forceFullResolution: true });
+      await flush();
+      ctrl.discardRecording(id);
+      expect(cam.forceCalls).toEqual([true, false]);
+    });
+
+    it("releases force when a maxDurationMs auto-stop fires after the recorder has started", async () => {
+      const cam = client.camera(42);
+      cam.maxRenderSize = { width: 320, height: 240 };
+      cam.emitState(makeCameraState({ flightId: 42 }));
+      ctrl.startRecording(42, { forceFullResolution: true, maxDurationMs: 5 });
+      await new Promise((r) => setTimeout(r, 30));
+
+      expect(ctrl.isRecording(42)).toBe(false);
+      expect(cam.forceCalls).toEqual([true, false]);
+    });
+
+    it("releases force cleanly when a maxDurationMs auto-stop fires while still arming", async () => {
+      const cam = client.camera(42);
+      cam.maxRenderSize = { width: 1920, height: 1080 };
+      cam.emitState(
+        makeCameraState({
+          flightId: 42,
+          renderWidth: 160,
+          renderHeight: 120,
+          operatorWidth: 160,
+          operatorHeight: 120,
+        }),
+      ); // never reaches full on its own
+
+      const id = ctrl.startRecording(42, {
+        forceFullResolution: true,
+        maxDurationMs: 5,
+      });
+      expect(ctrl.getSnapshot().active.find((a) => a.recordingId === id)?.arming).toBe(true);
+
+      await new Promise((r) => setTimeout(r, 30));
+
+      expect(ctrl.isRecording(42)).toBe(false);
+      expect(cam.forceCalls).toEqual([true, false]);
+      const handle = ctrl.fetchRecording(id);
+      expect(handle?.recordingId).toBe(id);
+      /* The recorder was never actually started. */
+      expect(handle?.byteSize).toBe(0);
+    });
+
+    it("discarding mid-arm releases force and never starts the recorder", async () => {
+      const cam = client.camera(42);
+      cam.maxRenderSize = { width: 1920, height: 1080 };
+      cam.emitState(
+        makeCameraState({
+          flightId: 42,
+          renderWidth: 160,
+          renderHeight: 120,
+          operatorWidth: 160,
+          operatorHeight: 120,
+        }),
+      );
+
+      const id = ctrl.startRecording(42, { forceFullResolution: true });
+      expect(ctrl.getSnapshot().active.find((a) => a.recordingId === id)?.arming).toBe(true);
+
+      ctrl.discardRecording(id);
+
+      expect(cam.forceCalls).toEqual([true, false]);
+      expect(ctrl.isRecording(42)).toBe(false);
+      /* The arm-wait's "change" subscription was cancelled, not leaked. */
+      expect(cam.changeListenerCount).toBe(0);
+
+      /* Even if the feed reaches full resolution after the discard, nothing
+         resurrects this recording or starts its recorder. */
+      cam.emitState(
+        makeCameraState({
+          flightId: 42,
+          renderWidth: 1920,
+          renderHeight: 1080,
+          operatorWidth: 1920,
+          operatorHeight: 1080,
+        }),
+      );
+      await flush();
+      expect(ctrl.fetchRecording(id)).toBeUndefined();
+      expect(ctrl.getSnapshot().active).toHaveLength(0);
+    });
+
+    it("releases force only on the second stop of two overlapping recordings of the same feed", async () => {
+      const original = (globalThis as { MediaRecorder?: unknown }).MediaRecorder;
+      (globalThis as { MediaRecorder?: unknown }).MediaRecorder = DeferredStubMediaRecorder;
+      try {
+        const cam = client.camera(42);
+        cam.maxRenderSize = { width: 320, height: 240 };
+        cam.emitState(makeCameraState({ flightId: 42 })); // already "full", so it arms instantly
+
+        const id1 = ctrl.startRecording(42, { forceFullResolution: true });
+        await flush();
+        expect(cam.forceCalls).toEqual([true]);
+
+        /* id1's recorder.state flips to "inactive" synchronously, but its
+           "stop" event (and its force release) is deferred. */
+        const stop1 = ctrl.stopRecording(id1);
+        /* Discarding it (rather than awaiting stop1) frees byFlight/active
+           immediately, same as the existing discard-while-settling case,
+           while id1's own release stays pending until its deferred stop
+           actually fires below. */
+        ctrl.discardRecording(id1);
+
+        /* A new recording of the same feed starts while id1's belated
+           release is still outstanding: a genuine overlap. The ref-count is
+           already at 1 (id1's, not yet released), so this second acquire
+           (1 -> 2) sends no redundant `true`, since the feed is already
+           forced. */
+        const id2 = ctrl.startRecording(42, { forceFullResolution: true });
+        await flush();
+        expect(cam.forceCalls).toEqual([true]);
+
+        /* id1's deferred stop finally fires: the FIRST release. The
+           ref-count (2 -> 1) must not clear the force while id2 still holds it. */
+        expect(DeferredStubMediaRecorder.pendingStops).toHaveLength(1);
+        DeferredStubMediaRecorder.pendingStops.pop()!();
+        await stop1;
+        expect(cam.forceCalls).toEqual([true]);
+
+        /* Only id2's stop, the SECOND release, actually clears it. */
+        const stop2 = ctrl.stopRecording(id2);
+        expect(DeferredStubMediaRecorder.pendingStops).toHaveLength(1);
+        DeferredStubMediaRecorder.pendingStops.pop()!();
+        await stop2;
+        expect(cam.forceCalls).toEqual([true, false]);
+      } finally {
+        (globalThis as { MediaRecorder?: unknown }).MediaRecorder = original;
+        DeferredStubMediaRecorder.pendingStops = [];
+      }
+    });
+
+    it("retries the force-true send on a later overlapping acquire after the first send failed", async () => {
+      const original = (globalThis as { MediaRecorder?: unknown }).MediaRecorder;
+      (globalThis as { MediaRecorder?: unknown }).MediaRecorder = DeferredStubMediaRecorder;
+      try {
+        const cam = client.camera(42);
+        cam.maxRenderSize = { width: 320, height: 240 };
+        cam.forceRejectCount = 1; // id1's force-true send fails silently
+        cam.emitState(makeCameraState({ flightId: 42 })); // already "full", so it arms instantly
+
+        const id1 = ctrl.startRecording(42, { forceFullResolution: true });
+        await flush();
+        /* The send was attempted (0 -> 1 acquire) but rejected: the feed
+           was never actually forced. */
+        expect(cam.forceCalls).toEqual([true]);
+
+        const stop1 = ctrl.stopRecording(id1);
+        ctrl.discardRecording(id1);
+
+        /* A second, overlapping recording of the same feed acquires while
+           id1's belated release is still outstanding (ref-count 1 -> 2).
+           Because the first send failed, this acquire must retry the true
+           send rather than assuming the feed is already forced. */
+        const id2 = ctrl.startRecording(42, { forceFullResolution: true });
+        await flush();
+        expect(cam.forceCalls).toEqual([true, true]);
+
+        /* id1's deferred stop finally fires: the FIRST release. The
+           ref-count (2 -> 1) must not clear the force while id2 still
+           holds it. */
+        expect(DeferredStubMediaRecorder.pendingStops).toHaveLength(1);
+        DeferredStubMediaRecorder.pendingStops.pop()!();
+        await stop1;
+        expect(cam.forceCalls).toEqual([true, true]);
+
+        /* Only id2's stop, the SECOND release, actually clears it. */
+        const stop2 = ctrl.stopRecording(id2);
+        expect(DeferredStubMediaRecorder.pendingStops).toHaveLength(1);
+        DeferredStubMediaRecorder.pendingStops.pop()!();
+        await stop2;
+        expect(cam.forceCalls).toEqual([true, true, false]);
+      } finally {
+        (globalThis as { MediaRecorder?: unknown }).MediaRecorder = original;
+        DeferredStubMediaRecorder.pendingStops = [];
+      }
+    });
+  });
+
+  describe("not forced", () => {
+    it("sends no force message and never arms", async () => {
+      const cam = client.camera(42);
+      const id = ctrl.startRecording(42);
+
+      expect(cam.forceCalls).toEqual([]);
+      expect(ctrl.getSnapshot().active.find((a) => a.recordingId === id)?.arming).toBe(false);
+
+      await ctrl.stopRecording(id);
+      expect(cam.forceCalls).toEqual([]);
+    });
   });
 });
 

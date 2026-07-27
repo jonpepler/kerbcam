@@ -262,6 +262,19 @@ pub struct SetRenderSizePayload {
     pub height: u32,
 }
 
+/// Forces a camera to render at the operator ceiling regardless of
+/// display-size demand. Per-viewer, OR-aggregated by the sidecar: a feed
+/// stays forced while any connected viewer forces it, and releases when
+/// the last one clears it (or disconnects). Still yields to the adaptive
+/// framerate shed; overrides only the demand term.
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetForceFullResolutionPayload {
+    pub flight_id: u32,
+    pub force: bool,
+}
+
 /// Which moving thing a pan+zoom camera should auto-aim at. `None` = tracking
 /// off (manual pan resumes). `ActiveVessel` and `Target` resolve to a world
 /// position from `FlightGlobals` (the active vessel, or its target) with no
@@ -530,6 +543,13 @@ pub enum ClientMessage {
     /// command: this is a per-consumer input, not a shared override — a
     /// departing consumer's size is cleared so the max relaxes.
     ReportDisplaySize(ReportDisplaySizePayload),
+    /// Force a camera to render at the operator ceiling regardless of
+    /// display-size demand. Per-viewer, OR-aggregated by the sidecar: a
+    /// feed stays forced while any connected viewer forces it, and
+    /// releases when the last one clears it (or disconnects). Still
+    /// yields to the adaptive framerate shed; overrides only the demand
+    /// term, never the perf-protection ceiling.
+    SetForceFullResolution(SetForceFullResolutionPayload),
     /// Set the camera's field-of-view (degrees). Silently ignored for
     /// parts whose Hullcam module is the fixed base (`supportsZoom ==
     /// false`); clients are expected to clamp to `fovMin / fovMax`
@@ -737,6 +757,21 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn set_force_full_resolution_roundtrips() {
+        let s = r#"{"type":"set-force-full-resolution","content":{"flightId":7,"force":true}}"#;
+        let back: ClientMessage = serde_json::from_str(s).unwrap();
+        match &back {
+            ClientMessage::SetForceFullResolution(p) => {
+                assert_eq!(p.flight_id, 7);
+                assert!(p.force);
+            }
+            _ => panic!("wrong variant"),
+        }
+        let re_serialized = serde_json::to_string(&back).unwrap();
+        assert_eq!(re_serialized, s);
     }
 
     #[test]

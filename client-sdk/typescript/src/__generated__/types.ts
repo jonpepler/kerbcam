@@ -281,6 +281,18 @@ export interface SetDegradePayload {
 	level: number;
 }
 
+/**
+ * Forces a camera to render at the operator ceiling regardless of
+ * display-size demand. Per-viewer, OR-aggregated by the sidecar: a feed
+ * stays forced while any connected viewer forces it, and releases when
+ * the last one clears it (or disconnects). Still yields to the adaptive
+ * framerate shed; overrides only the demand term.
+ */
+export interface SetForceFullResolutionPayload {
+	flightId: number;
+	force: boolean;
+}
+
 export interface SetFovPayload {
 	flightId: number;
 	fov: number;
@@ -452,6 +464,15 @@ export type ClientMessage =
 	 * departing consumer's size is cleared so the max relaxes.
 	 */
 	| { type: "report-display-size", content: ReportDisplaySizePayload }
+	/**
+	 * Force a camera to render at the operator ceiling regardless of
+	 * display-size demand. Per-viewer, OR-aggregated by the sidecar: a
+	 * feed stays forced while any connected viewer forces it, and
+	 * releases when the last one clears it (or disconnects). Still
+	 * yields to the adaptive framerate shed; overrides only the demand
+	 * term, never the perf-protection ceiling.
+	 */
+	| { type: "set-force-full-resolution", content: SetForceFullResolutionPayload }
 	/**
 	 * Set the camera's field-of-view (degrees). Silently ignored for
 	 * parts whose Hullcam module is the fixed base (`supportsZoom ==
