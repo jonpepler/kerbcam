@@ -776,7 +776,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
 
     const topOverlay = (
       <TopOverlay>
-        <TitleRow $recording={recordingActive}>
+        <TitleRow>
           <TopTitle>
             {hasCameras ? (
               <TitleButton
@@ -1573,7 +1573,7 @@ const TopOverlay = styled.div`
   }
 `;
 
-const TitleRow = styled.div<{ $recording?: boolean }>`
+const TitleRow = styled.div`
   display: flex;
   align-items: flex-start;
   gap: 8px;
@@ -1581,13 +1581,6 @@ const TitleRow = styled.div<{ $recording?: boolean }>`
      to the camera step buttons too) so a long title ellipsizes rather than
      sliding underneath the controls. */
   padding-right: 96px;
-  /* RecBadge is a sibling of TopOverlay (always visible, not hover-gated),
-     pinned to the same top-left corner this row occupies. Reserve a
-     matching gutter here so the title never renders underneath it while
-     recording; sized for a two-digit-minute elapsed timer (REC 99:59), the
-     realistic long case, so the title still ellipsizes gracefully rather
-     than sitting under the badge on any longer recording. */
-  ${(p) => p.$recording && "padding-left: 128px;"}
 `;
 
 const TopTitle = styled.h3`
@@ -1772,7 +1765,9 @@ const RecordActionButton = styled(OverlayIconButton)<{ $active?: boolean }>`
    recording (not hover chrome), same convention as StaleBadge. */
 const RecBadge = styled.div`
   position: absolute;
-  top: 8px;
+  /* Sits just under the hover-gated title/source dropdown (both are top-left)
+     so an active recording stays visible without displacing that control. */
+  top: 28px;
   left: 8px;
   z-index: 2;
   display: flex;
