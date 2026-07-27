@@ -40,8 +40,89 @@ import {
   CameraFeed,
   type CameraFeedHandle,
   type CameraStreamHook,
+  type FeedAction,
 } from "./CameraFeed";
 import { KerbcastProvider } from "./context";
+
+/*
+ * The REC control reads/drives `useRecordings()` (see CameraFeed - REC below).
+ * The real hook sits on top of a real `RecordingController`, which under
+ * jsdom needs a track-bearing MediaStream the noise-pipeline stub doesn't
+ * produce (`canvas.captureStream()` is stubbed empty). Stand in a fake store
+ * that mirrors the real hook's shape (its own per-component useState, so
+ * start/stop naturally re-render the owning CameraFeed exactly like the real
+ * hook does) so the REC tests exercise CameraFeed's wiring to the store's
+ * contract without depending on a real MediaRecorder track.
+ */
+const recordingsStoreSpies = vi.hoisted(() => ({
+  start: vi.fn(),
+  stop: vi.fn(),
+  /** When true, the fake store's stop() rejects instead of resolving -- lets
+   *  a test drive CameraFeed's stop-failure path (see "CameraFeed - REC"). */
+  stopRejects: false,
+}));
+
+vi.mock("./hooks/useRecordings", async () => {
+  const { useCallback, useState: useReactState } = await import("react");
+
+  interface FakeActive {
+    recordingId: string;
+    flightId: number;
+    startedAt: number;
+  }
+
+  function useRecordings() {
+    const [state, setState] = useReactState<{
+      active: FakeActive[];
+      recordings: unknown[];
+    }>({ active: [], recordings: [] });
+
+    const start = useCallback((flightId: number): string => {
+      recordingsStoreSpies.start(flightId);
+      const recordingId = `rec-${flightId}`;
+      setState((s) => ({
+        ...s,
+        active: [...s.active, { recordingId, flightId, startedAt: performance.now() }],
+      }));
+      return recordingId;
+    }, []);
+
+    const stop = useCallback(async (recordingId: string) => {
+      recordingsStoreSpies.stop(recordingId);
+      if (recordingsStoreSpies.stopRejects) {
+        throw new Error("stop failed");
+      }
+      const handle = {
+        recordingId,
+        blob: new Blob(),
+        mimeType: "video/webm",
+        utSamples: [],
+        byteSize: 0,
+        durationMs: 0,
+      };
+      setState((s) => ({
+        active: s.active.filter((a) => a.recordingId !== recordingId),
+        recordings: [...s.recordings, handle],
+      }));
+      return handle;
+    }, []);
+
+    return {
+      recordings: state.recordings,
+      groups: [],
+      active: state.active,
+      isRecording: (flightId: number) => state.active.some((a) => a.flightId === flightId),
+      start,
+      stop,
+      startGroup: vi.fn(),
+      stopGroup: vi.fn(),
+      discard: vi.fn(),
+      discardGroup: vi.fn(),
+    };
+  }
+
+  return { useRecordings };
+});
 
 // ---------------------------------------------------------------------------
 // Camera-state fixture factory
@@ -156,6 +237,11 @@ function renderFeed(
     renderSize?: "auto" | "none";
     enableQualityControl?: boolean;
     enableTracking?: boolean;
+    enableRecording?: boolean;
+    enableFullscreen?: boolean;
+    enablePictureInPicture?: boolean;
+    actions?: FeedAction[];
+    trailingActions?: FeedAction[];
     showStatic?: boolean;
     showStandbyIcon?: boolean;
     showActions?: boolean;
@@ -216,6 +302,9 @@ afterEach(() => {
   }
   createdClients.length = 0;
   vi.restoreAllMocks();
+  recordingsStoreSpies.start.mockClear();
+  recordingsStoreSpies.stop.mockClear();
+  recordingsStoreSpies.stopRejects = false;
 });
 
 // ---------------------------------------------------------------------------
@@ -1413,6 +1502,50 @@ describe("CameraFeed - showActions", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Action-bar overflow threshold crossing -- never-remount regression
+// ---------------------------------------------------------------------------
+
+describe("CameraFeed - action bar overflow threshold crossing", () => {
+  it("never remounts the <video> element when the actions count crosses the overflow threshold", async () => {
+    const { client } = await buildConnectedSource();
+
+    function Harness() {
+      const [count, setCount] = useState(3);
+      const actions = Array.from({ length: count }, (_, i) => ({
+        id: `extra-${i}`,
+        label: `Extra ${i}`,
+        icon: <span>{i}</span>,
+        onClick: () => {},
+      }));
+      return (
+        <KerbcastProvider client={client}>
+          <CameraFeed flightId={42} actions={actions} />
+          <button type="button" onClick={() => setCount(4)}>
+            grow
+          </button>
+        </KerbcastProvider>
+      );
+    }
+
+    const { container } = render(<Harness />);
+    const before = container.querySelector("video");
+    expect(before).toBeTruthy();
+    // Below the threshold (3 total): every action is inline, no ⋮ trigger.
+    expect(screen.queryByRole("button", { name: /more actions/i })).toBeNull();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^grow$/i }));
+    });
+
+    // Crossed the threshold (4 total, all non-stateful >= 2): the ⋮ trigger
+    // now appears -- but the SAME <video> node is still there, never remounted.
+    expect(screen.getByRole("button", { name: /more actions/i })).toBeTruthy();
+    const after = container.querySelector("video");
+    expect(after).toBe(before);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Pan reticle
 // ---------------------------------------------------------------------------
 
@@ -1844,5 +1977,294 @@ describe("CameraFeed - tracking (crosshair)", () => {
     });
     expect((getByLabelText("Zoom in") as HTMLButtonElement).disabled).toBe(false);
     expect((getByLabelText("Pan left") as HTMLButtonElement).disabled).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// REC (per-feed recording)
+// ---------------------------------------------------------------------------
+
+describe("CameraFeed - REC", () => {
+  it("does not render REC without enableRecording", async () => {
+    const { client } = await buildConnectedSource();
+    const { queryByLabelText } = renderFeed(client, { flightId: 42 });
+    expect(queryByLabelText("Start recording")).toBeNull();
+  });
+
+  it("renders an idle REC toggle when enableRecording", async () => {
+    const { client } = await buildConnectedSource();
+    const { getByLabelText, queryByLabelText } = renderFeed(client, {
+      flightId: 42,
+      enableRecording: true,
+    });
+    const rec = getByLabelText("Start recording");
+    expect(rec.getAttribute("aria-pressed")).toBe("false");
+    // No red-dot/timer badge while idle.
+    expect(queryByLabelText("Recording")).toBeNull();
+  });
+
+  it("clicking idle REC starts a recording via the store", async () => {
+    const { client } = await buildConnectedSource();
+    const { getByLabelText } = renderFeed(client, {
+      flightId: 42,
+      enableRecording: true,
+    });
+
+    fireEvent.click(getByLabelText("Start recording"));
+
+    expect(recordingsStoreSpies.start).toHaveBeenCalledWith(42);
+    const rec = getByLabelText("Stop recording");
+    expect(rec.getAttribute("aria-pressed")).toBe("true");
+    expect(getByLabelText("Recording")).toBeTruthy();
+  });
+
+  it("clicking active REC stops the recording via the store", async () => {
+    const { client } = await buildConnectedSource();
+    const { getByLabelText, queryByLabelText } = renderFeed(client, {
+      flightId: 42,
+      enableRecording: true,
+    });
+
+    fireEvent.click(getByLabelText("Start recording"));
+    await act(async () => {
+      fireEvent.click(getByLabelText("Stop recording"));
+    });
+
+    expect(recordingsStoreSpies.stop).toHaveBeenCalledWith("rec-42");
+    expect(getByLabelText("Start recording").getAttribute("aria-pressed")).toBe("false");
+    expect(queryByLabelText("Recording")).toBeNull();
+  });
+
+  it("does not leave an unhandled rejection when the store's stop() fails", async () => {
+    recordingsStoreSpies.stopRejects = true;
+    const { client } = await buildConnectedSource();
+    const { getByLabelText } = renderFeed(client, {
+      flightId: 42,
+      enableRecording: true,
+    });
+
+    fireEvent.click(getByLabelText("Start recording"));
+    await act(async () => {
+      fireEvent.click(getByLabelText("Stop recording"));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    /* Reaching here without vitest reporting an unhandled rejection is the
+       assertion: toggleRecording's void recordings.stop(...) must catch. */
+    expect(recordingsStoreSpies.stop).toHaveBeenCalledWith("rec-42");
+  });
+
+  it("reads recording state from the store, not local state", async () => {
+    // Two feeds on independent flightIds: starting one's recording must not
+    // flip the other's REC control -- isRecording(flightId) is per-feed.
+    const { client } = await buildConnectedSource([
+      makeCamera({ flightId: 42, cameraName: "Cam A" }),
+      makeCamera({ flightId: 43, cameraName: "Cam B" }),
+    ]);
+    renderFeed(client, { flightId: 42, enableRecording: true });
+    renderFeed(client, { flightId: 43, enableRecording: true });
+
+    fireEvent.click(screen.getAllByLabelText("Start recording")[0]);
+
+    const stopButtons = screen.queryAllByLabelText("Stop recording");
+    const idleButtons = screen.queryAllByLabelText("Start recording");
+    expect(stopButtons).toHaveLength(1);
+    expect(idleButtons).toHaveLength(1);
+  });
+
+  it("shows a live elapsed timer while recording", async () => {
+    vi.useFakeTimers({
+      toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"],
+    });
+    try {
+      const { client } = await buildConnectedSource();
+      const { getByLabelText } = renderFeed(client, {
+        flightId: 42,
+        enableRecording: true,
+      });
+
+      act(() => {
+        fireEvent.click(getByLabelText("Start recording"));
+      });
+      expect(getByLabelText("Recording").textContent).toBe("REC 0:00");
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3000);
+      });
+      expect(getByLabelText("Recording").textContent).toBe("REC 0:03");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("REC is a stateful primary that never enters the ⋮ overflow", async () => {
+    const { client } = await buildConnectedSource();
+    const extraActions: FeedAction[] = Array.from({ length: 3 }, (_, i) => ({
+      id: `extra-${i}`,
+      label: `Extra ${i}`,
+      icon: <span>{i}</span>,
+      onClick: () => {},
+    }));
+    const { getByLabelText, getByRole } = renderFeed(client, {
+      flightId: 42,
+      enableRecording: true,
+      actions: extraActions,
+    });
+
+    // Crowded (>= 4 total, >= 2 non-stateful): the overflow trigger exists...
+    expect(getByRole("button", { name: /more actions/i })).toBeTruthy();
+    // ...but REC is directly queryable without opening it -- it never
+    // collapsed into the menu.
+    expect(getByLabelText("Start recording")).toBeTruthy();
+  });
+
+  it("never remounts the <video> element across a start/stop cycle", async () => {
+    const { client } = await buildConnectedSource();
+    const { container, getByLabelText } = renderFeed(client, {
+      flightId: 42,
+      enableRecording: true,
+    });
+    const before = container.querySelector("video");
+    expect(before).toBeTruthy();
+
+    fireEvent.click(getByLabelText("Start recording"));
+    await act(async () => {
+      fireEvent.click(getByLabelText("Stop recording"));
+    });
+
+    const after = container.querySelector("video");
+    expect(after).toBe(before);
+  });
+});
+
+describe("CameraFeed - recording locks source and close", () => {
+  it("disables the camera source dropdown while recording, with a hint, and re-enables on stop", async () => {
+    const { client } = await buildConnectedSource();
+    const { getByLabelText, getByRole } = renderFeed(client, {
+      flightId: 42,
+      enableRecording: true,
+    });
+
+    const source = getByRole<HTMLButtonElement>("button", { name: /starboard cam/i });
+    expect(source.disabled).toBe(false);
+
+    fireEvent.click(getByLabelText("Start recording"));
+
+    expect(source.disabled).toBe(true);
+    expect(source.title).toBe("Stop recording to change camera");
+
+    await act(async () => {
+      fireEvent.click(getByLabelText("Stop recording"));
+    });
+
+    expect(source.disabled).toBe(false);
+  });
+
+  it("does not open the camera menu when the source dropdown is clicked while recording", async () => {
+    const { client } = await buildConnectedSource([
+      makeCamera({ flightId: 42, cameraName: "Starboard Cam" }),
+      makeCamera({ flightId: 43, cameraName: "Nose Cam" }),
+    ]);
+    const { getByLabelText, getByRole, queryAllByRole } = renderFeed(client, {
+      flightId: 42,
+      enableRecording: true,
+    });
+
+    fireEvent.click(getByLabelText("Start recording"));
+    fireEvent.click(getByRole("button", { name: /starboard cam/i }));
+
+    expect(queryAllByRole("menuitemradio")).toHaveLength(0);
+  });
+
+  it("disables the pinned trailing close control while recording and re-enables on stop", async () => {
+    const onClose = vi.fn();
+    const { client } = await buildConnectedSource();
+    const { getByLabelText } = renderFeed(client, {
+      flightId: 42,
+      enableRecording: true,
+      trailingActions: [
+        { id: "close", label: "Close", icon: <span>x</span>, onClick: onClose },
+      ],
+    });
+
+    const close = getByLabelText("Close") as HTMLButtonElement;
+    expect(close.disabled).toBe(false);
+
+    fireEvent.click(getByLabelText("Start recording"));
+
+    expect(close.disabled).toBe(true);
+    expect(close.title).toBe("Stop recording to close this feed");
+    fireEvent.click(close);
+    expect(onClose).not.toHaveBeenCalled();
+
+    await act(async () => {
+      fireEvent.click(getByLabelText("Stop recording"));
+    });
+
+    expect(close.disabled).toBe(false);
+    fireEvent.click(close);
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps tracking, PiP, fullscreen, and the REC(stop) button enabled while recording", async () => {
+    const fsDoc = document as Document & { fullscreenEnabled?: boolean };
+    const pipDoc = document as Document & { pictureInPictureEnabled?: boolean };
+    Object.defineProperty(fsDoc, "fullscreenEnabled", { value: true, configurable: true });
+    Object.defineProperty(pipDoc, "pictureInPictureEnabled", { value: true, configurable: true });
+
+    try {
+      const { client } = await buildConnectedSource([
+        makeCamera({
+          flightId: 42,
+          cameraName: "Launchpad Cam",
+          supportsPan: true,
+          supportsZoom: true,
+          panPitchMin: -90,
+          panPitchMax: 90,
+        }),
+      ]);
+      const { getByLabelText, queryByLabelText } = renderFeed(client, {
+        flightId: 42,
+        enableRecording: true,
+        enableTracking: true,
+        enableFullscreen: true,
+        enablePictureInPicture: true,
+      });
+
+      fireEvent.click(getByLabelText("Start recording"));
+
+      // Tracking + REC are stateful primaries, always inline; PiP + fullscreen
+      // (non-stateful) collapse into the ⋮ overflow once the row is crowded
+      // (REC + tracking + PiP + fullscreen == 4), so open it to reach them.
+      const overflowTrigger = queryByLabelText("More actions");
+      if (overflowTrigger) fireEvent.click(overflowTrigger);
+
+      expect((getByLabelText("Auto-track") as HTMLButtonElement).disabled).toBe(false);
+      expect((getByLabelText("Picture in picture") as HTMLButtonElement).disabled).toBe(false);
+      expect((getByLabelText("Enter fullscreen") as HTMLButtonElement).disabled).toBe(false);
+      expect((getByLabelText("Stop recording") as HTMLButtonElement).disabled).toBe(false);
+    } finally {
+      delete (fsDoc as { fullscreenEnabled?: boolean }).fullscreenEnabled;
+      delete (pipDoc as { pictureInPictureEnabled?: boolean }).pictureInPictureEnabled;
+    }
+  });
+
+  it("leaves the source dropdown and close control enabled when not recording", async () => {
+    const onClose = vi.fn();
+    const { client } = await buildConnectedSource();
+    const { getByLabelText, getByRole } = renderFeed(client, {
+      flightId: 42,
+      enableRecording: true,
+      trailingActions: [
+        { id: "close", label: "Close", icon: <span>x</span>, onClick: onClose },
+      ],
+    });
+
+    expect(getByRole<HTMLButtonElement>("button", { name: /starboard cam/i }).disabled).toBe(
+      false,
+    );
+    fireEvent.click(getByLabelText("Close"));
+    expect(onClose).toHaveBeenCalledTimes(1);
   });
 });

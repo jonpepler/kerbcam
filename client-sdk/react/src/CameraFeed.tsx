@@ -7,6 +7,7 @@ import {
   useId,
   useImperativeHandle,
   useMemo,
+  useReducer,
   useRef,
   useState,
 } from "react";
@@ -14,12 +15,23 @@ import { createPortal } from "react-dom";
 import styled, { css } from "styled-components";
 import { buildCameraLabeler } from "./cameraLabels";
 import { KerbcastProvider, useKerbcastClient } from "./context";
+import {
+  ActionBarRow,
+  FeedActionBar,
+  OverlayIconButton,
+  feedActionToEntry,
+  type FeedAction,
+  type FeedActionBarEntry,
+} from "./FeedActionBar";
 import { useKerbcastCameras } from "./hooks/useKerbcastCameras";
 import { useKerbcastInFlight } from "./hooks/useKerbcastInFlight";
 import { useKerbcastStream } from "./hooks/useKerbcastStream";
+import { useRecordings } from "./hooks/useRecordings";
 import { useReportDisplaySize } from "./hooks/useReportDisplaySize";
 import { StandbyIcon } from "./StandbyIcon";
 import { isCameraDestroyed } from "./lifecycle";
+import { usePortalMenu } from "./menuPositioning";
+import { formatElapsed, nowMs } from "./timing";
 
 // ---------------------------------------------------------------------------
 // Tuning constants
@@ -29,124 +41,6 @@ const MENU_MAX_WIDTH = 260; // matches CameraMenu's CSS cap
 const MENU_MAX_HEIGHT = 300; // matches CameraMenu's min(40vh, 300px) cap
 const QUALITY_MENU_MAX_WIDTH = 220; // matches QualityMenu's CSS cap
 const QUALITY_MENU_MAX_HEIGHT = 220; // matches QualityMenu's min(40vh, 220px) cap
-const MENU_GAP = 4; // trigger-to-menu spacing
-const MENU_EDGE = 8; // minimum inset from the viewport edge
-
-/*
- * Geometry of a portaled dropdown: the CSS size caps of the menu (the
- * helper clamps as if the menu fills them) and which edge of the trigger
- * the menu hangs from: "start" lines the menu's left edge up with the
- * trigger's (camera picker), "end" lines the right edges up (quality
- * button at the action bar's corner).
- */
-interface MenuAnchor {
-  maxWidth: number;
-  maxHeight: number;
-  align: "start" | "end";
-}
-
-/*
- * Fixed-position style for a portaled menu, anchored to its trigger button.
- * Opens downward by default; flips above the trigger when there is not
- * enough room below but there is above, otherwise clamps to the viewport.
- */
-function computeMenuPosition(
-  trigger: HTMLElement,
-  anchor: MenuAnchor,
-): React.CSSProperties {
-  const rect = trigger.getBoundingClientRect();
-  const vw = window.innerWidth;
-  const vh = window.innerHeight;
-  const width = Math.min(anchor.maxWidth, vw - 2 * MENU_EDGE);
-  /* Inline offset from the aligned viewport edge, clamped so a full-width
-     menu still fits inside the opposite edge. */
-  const inset = Math.max(MENU_EDGE, vw - width - MENU_EDGE);
-  const inline: React.CSSProperties =
-    anchor.align === "start"
-      ? { left: Math.min(Math.max(rect.left, MENU_EDGE), inset) }
-      : { right: Math.min(Math.max(vw - rect.right, MENU_EDGE), inset) };
-  const menuH = Math.min(0.4 * vh, anchor.maxHeight);
-  const fitsBelow = rect.bottom + MENU_GAP + menuH <= vh - MENU_EDGE;
-  const fitsAbove = rect.top - MENU_GAP - menuH >= MENU_EDGE;
-  if (!fitsBelow && fitsAbove) {
-    return { ...inline, bottom: vh - rect.top + MENU_GAP };
-  }
-  const top = Math.min(
-    rect.bottom + MENU_GAP,
-    Math.max(MENU_EDGE, vh - MENU_EDGE - menuH),
-  );
-  return { ...inline, top };
-}
-
-/*
- * Shared behaviour for a dropdown portaled to document.body: fixed position
- * computed from the trigger's rect (so tile overflow cannot clip it),
- * re-anchored on window resize/scroll while open, Escape to close with focus
- * returned to the trigger, and portal-aware outside-pointer-down dismissal
- * (menuRef points at the portaled menu, so clicks inside it stay "inside").
- * One menu at a time falls out of the dismissal: opening another menu's
- * trigger is an outside press for this one.
- */
-function usePortalMenu({ maxWidth, maxHeight, align }: MenuAnchor) {
-  const [open, setOpen] = useState(false);
-  const [position, setPosition] = useState<React.CSSProperties | null>(null);
-  const menuRef = useRef<HTMLDivElement>(null);
-  const triggerRef = useRef<HTMLButtonElement>(null);
-
-  useEffect(() => {
-    if (!open) {
-      setPosition(null);
-      return;
-    }
-    const update = () => {
-      const trigger = triggerRef.current;
-      if (trigger) {
-        setPosition(computeMenuPosition(trigger, { maxWidth, maxHeight, align }));
-      }
-    };
-    update();
-    window.addEventListener("resize", update);
-    window.addEventListener("scroll", update, true);
-    return () => {
-      window.removeEventListener("resize", update);
-      window.removeEventListener("scroll", update, true);
-    };
-  }, [open, maxWidth, maxHeight, align]);
-
-  useEffect(() => {
-    if (!open) return;
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.stopPropagation();
-        setOpen(false);
-        triggerRef.current?.focus();
-      }
-    };
-    const onPointerDown = (e: PointerEvent) => {
-      if (
-        !menuRef.current?.contains(e.target as Node) &&
-        !triggerRef.current?.contains(e.target as Node)
-      ) {
-        setOpen(false);
-      }
-    };
-    document.addEventListener("keydown", onKeyDown);
-    document.addEventListener("pointerdown", onPointerDown);
-    return () => {
-      document.removeEventListener("keydown", onKeyDown);
-      document.removeEventListener("pointerdown", onPointerDown);
-    };
-  }, [open]);
-
-  const toggle = useCallback(() => setOpen((v) => !v), []);
-  /** Close after an item pick, returning focus to the trigger. */
-  const close = useCallback(() => {
-    setOpen(false);
-    triggerRef.current?.focus();
-  }, []);
-
-  return { open, toggle, close, position, menuRef, triggerRef };
-}
 
 /*
  * Viewer quality presets, in menu order. Scales mirror the sidecar's
@@ -209,21 +103,11 @@ function exitFullscreen(): void {
 // ---------------------------------------------------------------------------
 
 /**
- * A consumer-supplied action rendered into the feed's top-right action bar.
- * Lets a host page (e.g. the sidecar's spotlight toggle) inject controls
- * without the library knowing what they do.
+ * The consumer-supplied action shape, and the shared top-right action bar
+ * both `CameraFeed` and `KerbalFaceFeed` render, live in `FeedActionBar`.
+ * Re-exported here since existing imports reference `./CameraFeed`.
  */
-export interface FeedAction {
-  /** Stable identity for the React key. */
-  id: string;
-  /** Accessible label; used for aria-label and the native tooltip. */
-  label: string;
-  /** Icon node, sized by the action bar (~14px). */
-  icon: React.ReactNode;
-  /** Toggle state: renders the button highlighted and sets aria-pressed. */
-  active?: boolean;
-  onClick: () => void;
-}
+export type { FeedAction } from "./FeedActionBar";
 
 /**
  * A hook that yields the live `MediaStream` for a resolved flightId. Must be
@@ -337,14 +221,28 @@ export interface CameraFeedProps {
    */
   enableTracking?: boolean;
   /**
+   * Show a built-in REC control in the action bar: a STATEFUL toggle (never
+   * overflow-eligible, per the #6 spec) that starts/stops a client-side
+   * recording of this feed via `useRecordings()`. Idle -> click starts
+   * (`start(flightId)`); active shows a red dot + a live elapsed timer on the
+   * tile -> click stops (`stop(recordingId)`) and the clip lands in the
+   * recordings store. Recording is purely client-local (this browser's own
+   * MediaRecorder, nothing server-authoritative) and read from the store
+   * (`isRecording(flightId)`), so it stays correct if toggled elsewhere (e.g.
+   * a REC+ grouped recording). Default false.
+   */
+  enableRecording?: boolean;
+  /**
    * Consumer-injected action buttons, rendered left of the built-in
    * fullscreen/PiP controls in the top-right action bar.
    */
   actions?: FeedAction[];
   /**
    * Consumer-injected action buttons rendered at the far end of the action
-   * bar, right of the built-in controls — the natural home for a close/remove
-   * button so it sits in the corner.
+   * bar: the natural home for a close/remove button. Always pinned trailing
+   * (never overflow-eligible, never counted toward the overflow threshold),
+   * so it sits in the corner as a persistent, single-click control, right of
+   * the ⋮ overflow trigger when one is present.
    */
   trailingActions?: FeedAction[];
   /**
@@ -393,6 +291,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       enablePictureInPicture = false,
       enableQualityControl = false,
       enableTracking = false,
+      enableRecording = false,
       actions,
       trailingActions,
       showActions = true,
@@ -401,6 +300,9 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     ref,
   ) {
     const client = useKerbcastClient();
+    // Always called (rules of hooks); `enableRecording` only gates whether the
+    // REC entry/badge render, not whether the store is subscribed.
+    const recordings = useRecordings();
     // The selectable set: every live camera, optionally narrowed by the host's
     // cameraFilter (e.g. a part-grid tile offering only part cams). Drives the
     // picker menu, the stepper, and the auto-latch fallback so none can land on
@@ -619,7 +521,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     );
 
     // -------------------------------------------------------------------------
-    // PanZoomController -- one per displayed camera
+    // PanZoomController: one per displayed camera
     // -------------------------------------------------------------------------
     const controllerRef = useRef<PanZoomController | null>(null);
     const [sliderFov, setSliderFov] = useState(60);
@@ -636,8 +538,8 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       controllerRef.current = ctrl;
 
       const unsubSlider = ctrl.onSliderFov(setSliderFov);
-      // Seed the slider from the controller's initial (0) -- will be overwritten
-      // immediately by syncFromState in the camera-state effect below.
+      // Seed the slider from the controller's initial (0). It will be
+      // overwritten immediately by syncFromState in the camera-state effect below.
       setSliderFov(ctrl.sliderFov);
 
       return () => {
@@ -828,9 +730,53 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       [client, flightId, trackMode, closeTrackingMenu],
     );
 
+    // -------------------------------------------------------------------------
+    // REC control (opt-in). A stateful toggle that starts/stops a client-side
+    // recording of this feed via the recordings store; state is read from the
+    // store (isRecording), never held locally, so it stays correct if the
+    // recording was started elsewhere (e.g. a REC+ grouped recording).
+    // -------------------------------------------------------------------------
+    const recordingActive =
+      enableRecording && flightId !== null && recordings.isRecording(flightId);
+    const activeRecording = recordingActive
+      ? recordings.active.find((a) => a.flightId === flightId)
+      : undefined;
+
+    // Ticks once a second while recording so the elapsed timer stays live;
+    // the timer itself is derived from activeRecording.startedAt each render.
+    const [, tickRecordingTimer] = useReducer((c: number) => c + 1, 0);
+    useEffect(() => {
+      if (!recordingActive) return;
+      const interval = setInterval(tickRecordingTimer, 1000);
+      return () => clearInterval(interval);
+    }, [recordingActive]);
+
+    const recordingElapsedMs = activeRecording ? nowMs() - activeRecording.startedAt : 0;
+
+    const toggleRecording = useCallback(() => {
+      if (flightId === null) return;
+      if (recordingActive) {
+        const active = recordings.active.find((a) => a.flightId === flightId);
+        if (active) {
+          void recordings.stop(active.recordingId).catch(() => {
+            /* A rejected stop shouldn't leave the REC toggle wedged; the
+               store's own state (active/recordings) is the source of truth
+               for whether it's still "recording", not this call's outcome. */
+          });
+        }
+        return;
+      }
+      try {
+        recordings.start(flightId);
+      } catch {
+        /* no live track yet, or a race with a recording already in progress
+           elsewhere on this feed; the operator can retry once live. */
+      }
+    }, [flightId, recordingActive, recordings]);
+
     const topOverlay = (
       <TopOverlay>
-        <TitleRow>
+        <TitleRow $recording={recordingActive}>
           <TopTitle>
             {hasCameras ? (
               <TitleButton
@@ -839,7 +785,9 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                 aria-haspopup="menu"
                 aria-expanded={cameraMenu.open}
                 aria-controls={menuId}
-                onClick={cameraMenu.toggle}
+                disabled={recordingActive}
+                title={recordingActive ? "Stop recording to change camera" : undefined}
+                onClick={recordingActive ? undefined : cameraMenu.toggle}
               >
                 <TitleButton__Text>{title}</TitleButton__Text>
                 <ChevronDownIcon aria-hidden="true" />
@@ -894,121 +842,205 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       </TopOverlay>
     );
 
-    const renderAction = (a: FeedAction) => (
-      <OverlayIconButton
-        key={a.id}
-        type="button"
-        aria-label={a.label}
-        aria-pressed={a.active ?? undefined}
-        title={a.label}
-        $active={a.active ?? false}
-        onClick={a.onClick}
-      >
-        {a.icon}
-      </OverlayIconButton>
-    );
+    /*
+     * Built-in action-bar entries, in the bar's natural (fallback) order:
+     * consumer actions, quality, tracking, PiP, fullscreen, trailing actions.
+     * FeedActionBar partitions these into primary/overflow (see its own
+     * doc-comment); tracking is the only built-in marked `stateful` today,
+     * per #6's "stateful toggles stay primary" rule (REC joins it the same
+     * way).
+     */
+    const trackingLabel = tracking
+      ? trackMode === TrackMode.Target
+        ? "Auto-tracking target"
+        : "Auto-tracking active vessel"
+      : "Auto-track a vessel";
+    const pipLabel = isPip ? "Exit picture in picture" : "Picture in picture";
+    const fullscreenLabel = isFullscreen ? "Exit fullscreen" : "Enter fullscreen";
+    const recordingLabel = recordingActive ? "Stop recording" : "Start recording";
+
+    const entries: FeedActionBarEntry[] = [
+      ...(actions?.map(feedActionToEntry) ?? []),
+      ...(qualityAvailable
+        ? [
+            {
+              id: "quality",
+              label: "Quality",
+              stateful: false,
+              render: () => (
+                <OverlayIconButton
+                  ref={qualityMenu.triggerRef}
+                  type="button"
+                  aria-label="Quality"
+                  aria-haspopup="menu"
+                  aria-expanded={qualityMenu.open}
+                  aria-controls={qualityMenuId}
+                  title={
+                    qualityThrottled
+                      ? "Quality (throttled by adaptive performance)"
+                      : "Quality"
+                  }
+                  $active={qualityMenu.open}
+                  onClick={qualityMenu.toggle}
+                >
+                  <QualityIcon />
+                  {qualityThrottled && <ThrottledDot aria-hidden="true" />}
+                </OverlayIconButton>
+              ),
+            } satisfies FeedActionBarEntry,
+          ]
+        : []),
+      ...(enableRecording && flightId !== null
+        ? [
+            {
+              id: "record",
+              label: recordingLabel,
+              stateful: true,
+              render: () => (
+                <RecordActionButton
+                  type="button"
+                  aria-label={recordingLabel}
+                  aria-pressed={recordingActive}
+                  title={recordingLabel}
+                  $active={recordingActive}
+                  onClick={toggleRecording}
+                >
+                  <RecordIcon />
+                </RecordActionButton>
+              ),
+            } satisfies FeedActionBarEntry,
+          ]
+        : []),
+      ...(trackingAvailable
+        ? [
+            {
+              id: "tracking",
+              label: trackingLabel,
+              stateful: true,
+              render: () => (
+                <OverlayIconButton
+                  ref={trackingMenu.triggerRef}
+                  type="button"
+                  aria-label="Auto-track"
+                  aria-haspopup="menu"
+                  aria-expanded={trackingMenu.open}
+                  aria-controls={trackingMenuId}
+                  aria-pressed={tracking}
+                  title={trackingLabel}
+                  $active={tracking || trackingMenu.open}
+                  onClick={trackingMenu.toggle}
+                >
+                  <CrosshairIcon />
+                </OverlayIconButton>
+              ),
+            } satisfies FeedActionBarEntry,
+          ]
+        : []),
+      ...(flightId !== null && pipAvailable
+        ? [
+            {
+              id: "pip",
+              label: pipLabel,
+              stateful: false,
+              render: () => (
+                <OverlayIconButton
+                  type="button"
+                  aria-label={pipLabel}
+                  aria-pressed={isPip}
+                  title={pipLabel}
+                  $active={isPip}
+                  onClick={togglePip}
+                >
+                  <PictureInPictureIcon />
+                </OverlayIconButton>
+              ),
+            } satisfies FeedActionBarEntry,
+          ]
+        : []),
+      ...(flightId !== null && fullscreenAvailable
+        ? [
+            {
+              id: "fullscreen",
+              label: fullscreenLabel,
+              stateful: false,
+              render: () => (
+                <OverlayIconButton
+                  type="button"
+                  aria-label={fullscreenLabel}
+                  aria-pressed={isFullscreen}
+                  title={fullscreenLabel}
+                  $active={isFullscreen}
+                  onClick={toggleFullscreen}
+                >
+                  {isFullscreen ? <FullscreenExitIcon /> : <FullscreenEnterIcon />}
+                </OverlayIconButton>
+              ),
+            } satisfies FeedActionBarEntry,
+          ]
+        : []),
+      /* trailingActions is always the pinned-trailing (close/remove) slot,
+         regardless of what the consumer's FeedAction sets. See its own
+         doc-comment on CameraFeedProps. While a recording is active, closing
+         the feed would lose it, so the control stays visible but disabled
+         and inert rather than disappearing. */
+      ...(trailingActions?.map((a) => {
+        const entry = feedActionToEntry(a);
+        if (!recordingActive) return { ...entry, pinnedTrailing: true };
+        return {
+          ...entry,
+          pinnedTrailing: true,
+          render: () => (
+            <OverlayIconButton
+              key={a.id}
+              type="button"
+              aria-label={a.label}
+              title="Stop recording to close this feed"
+              disabled
+              $active={a.active ?? false}
+            >
+              {a.icon}
+            </OverlayIconButton>
+          ),
+        };
+      }) ?? []),
+    ];
 
     const builtInActions =
       flightId !== null &&
-      (pipAvailable || fullscreenAvailable || qualityAvailable || trackingAvailable);
+      (pipAvailable ||
+        fullscreenAvailable ||
+        qualityAvailable ||
+        trackingAvailable ||
+        enableRecording);
     const hasActionBar =
       showActions &&
       (hasCameras ||
         (actions && actions.length > 0) ||
         (trailingActions && trailingActions.length > 0) ||
         builtInActions);
+    const stepButtons = hasCameras ? (
+      <StepButtons>
+        <OverlayIconButton
+          type="button"
+          aria-label="Previous camera"
+          disabled={!canStep}
+          onClick={() => stepCamera(-1)}
+        >
+          &#8249;
+        </OverlayIconButton>
+        <OverlayIconButton
+          type="button"
+          aria-label="Next camera"
+          disabled={!canStep}
+          onClick={() => stepCamera(1)}
+        >
+          &#8250;
+        </OverlayIconButton>
+      </StepButtons>
+    ) : null;
     const actionBar = hasActionBar ? (
-        <ActionBar>
-          {hasCameras && (
-            <StepButtons>
-              <OverlayIconButton
-                type="button"
-                aria-label="Previous camera"
-                disabled={!canStep}
-                onClick={() => stepCamera(-1)}
-              >
-                &#8249;
-              </OverlayIconButton>
-              <OverlayIconButton
-                type="button"
-                aria-label="Next camera"
-                disabled={!canStep}
-                onClick={() => stepCamera(1)}
-              >
-                &#8250;
-              </OverlayIconButton>
-            </StepButtons>
-          )}
-          {actions?.map(renderAction)}
-          {qualityAvailable && (
-            <OverlayIconButton
-              ref={qualityMenu.triggerRef}
-              type="button"
-              aria-label="Quality"
-              aria-haspopup="menu"
-              aria-expanded={qualityMenu.open}
-              aria-controls={qualityMenuId}
-              title={
-                qualityThrottled
-                  ? "Quality (throttled by adaptive performance)"
-                  : "Quality"
-              }
-              $active={qualityMenu.open}
-              onClick={qualityMenu.toggle}
-            >
-              <QualityIcon />
-              {qualityThrottled && <ThrottledDot aria-hidden="true" />}
-            </OverlayIconButton>
-          )}
-          {trackingAvailable && (
-            <OverlayIconButton
-              ref={trackingMenu.triggerRef}
-              type="button"
-              aria-label="Auto-track"
-              aria-haspopup="menu"
-              aria-expanded={trackingMenu.open}
-              aria-controls={trackingMenuId}
-              aria-pressed={tracking}
-              title={
-                tracking
-                  ? trackMode === TrackMode.Target
-                    ? "Auto-tracking target"
-                    : "Auto-tracking active vessel"
-                  : "Auto-track a vessel"
-              }
-              $active={tracking || trackingMenu.open}
-              onClick={trackingMenu.toggle}
-            >
-              <CrosshairIcon />
-            </OverlayIconButton>
-          )}
-          {flightId !== null && pipAvailable && (
-            <OverlayIconButton
-              type="button"
-              aria-label={isPip ? "Exit picture in picture" : "Picture in picture"}
-              aria-pressed={isPip}
-              title={isPip ? "Exit picture in picture" : "Picture in picture"}
-              $active={isPip}
-              onClick={togglePip}
-            >
-              <PictureInPictureIcon />
-            </OverlayIconButton>
-          )}
-          {flightId !== null && fullscreenAvailable && (
-            <OverlayIconButton
-              type="button"
-              aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
-              aria-pressed={isFullscreen}
-              title={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
-              $active={isFullscreen}
-              onClick={toggleFullscreen}
-            >
-              {isFullscreen ? <FullscreenExitIcon /> : <FullscreenEnterIcon />}
-            </OverlayIconButton>
-          )}
-          {trailingActions?.map(renderAction)}
-        </ActionBar>
-      ) : null;
+      <FeedActionBar leading={stepButtons} entries={entries} />
+    ) : null;
 
     return (
       <Stage ref={wrapRef} $pinned={chromePinned}>
@@ -1129,6 +1161,12 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
                   Stale
                 </StaleBadge>
               </>
+            )}
+            {recordingActive && (
+              <RecBadge role="status" aria-label="Recording">
+                <RecDot aria-hidden="true" />
+                REC {formatElapsed(recordingElapsedMs)}
+              </RecBadge>
             )}
             {showZoom && (
               <ZoomControlsWrap $disabled={manualDisabled} aria-hidden={manualDisabled}>
@@ -1367,6 +1405,15 @@ function PictureInPictureIcon() {
   );
 }
 
+/* REC: a plain filled dot, coloured by RecordActionButton's own $active state. */
+function RecordIcon() {
+  return (
+    <svg viewBox="0 0 16 16" width={14} height={14} fill="currentColor" stroke="none" aria-hidden="true">
+      <circle cx="8" cy="8" r="5" />
+    </svg>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Styled components
 // ---------------------------------------------------------------------------
@@ -1526,7 +1573,7 @@ const TopOverlay = styled.div`
   }
 `;
 
-const TitleRow = styled.div`
+const TitleRow = styled.div<{ $recording?: boolean }>`
   display: flex;
   align-items: flex-start;
   gap: 8px;
@@ -1534,6 +1581,13 @@ const TitleRow = styled.div`
      to the camera step buttons too) so a long title ellipsizes rather than
      sliding underneath the controls. */
   padding-right: 96px;
+  /* RecBadge is a sibling of TopOverlay (always visible, not hover-gated),
+     pinned to the same top-left corner this row occupies. Reserve a
+     matching gutter here so the title never renders underneath it while
+     recording; sized for a two-digit-minute elapsed timer (REC 99:59), the
+     realistic long case, so the title still ellipsizes gracefully rather
+     than sitting under the badge on any longer recording. */
+  ${(p) => p.$recording && "padding-left: 128px;"}
 `;
 
 const TopTitle = styled.h3`
@@ -1695,21 +1749,66 @@ const ThrottledDot = styled.span`
   box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.6);
 `;
 
-/* Top-right cluster of overlay controls (custom actions + fullscreen/PiP). */
-const ActionBar = styled.div`
+/* REC action-bar button: same shape as OverlayIconButton, its own red
+   $active colour (a coming-recording toggle should never read as the
+   green "on" of tracking/quality) via its own token so a consumer can
+   recolour it without touching --kerbcast-action-active. */
+const RecordActionButton = styled(OverlayIconButton)<{ $active?: boolean }>`
+  background: ${(p) =>
+    p.$active ? "var(--kerbcast-rec-active, #ff3b30)" : "rgba(0, 0, 0, 0.5)"};
+  border-color: ${(p) =>
+    p.$active ? "var(--kerbcast-rec-active, #ff3b30)" : "rgba(255, 255, 255, 0.3)"};
+  color: #fff;
+
+  @media (hover: hover) {
+    &:hover {
+      background: ${(p) =>
+        p.$active ? "var(--kerbcast-rec-active, #ff3b30)" : "rgba(0, 0, 0, 0.7)"};
+    }
+  }
+`;
+
+/* Persistent recording badge: red dot + elapsed timer, always visible while
+   recording (not hover chrome), same convention as StaleBadge. */
+const RecBadge = styled.div`
   position: absolute;
-  top: 6px;
-  right: 8px;
-  z-index: 3;
+  top: 8px;
+  left: 8px;
+  z-index: 2;
   display: flex;
   align-items: center;
-  gap: 4px;
-  opacity: 0;
+  gap: 5px;
+  padding: 2px 6px;
+  background: rgba(0, 0, 0, 0.6);
+  border: 1px solid var(--kerbcast-rec-active, #ff3b30);
+  border-radius: 3px;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.9);
   pointer-events: none;
-  transition: opacity 0.15s;
+`;
 
-  @media (prefers-reduced-motion: reduce) {
-    transition: none;
+const RecDot = styled.span`
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--kerbcast-rec-active, #ff3b30);
+  flex-shrink: 0;
+
+  @media (prefers-reduced-motion: no-preference) {
+    animation: rec-dot-pulse 1.6s ease-in-out infinite;
+  }
+
+  @keyframes rec-dot-pulse {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.4;
+    }
   }
 `;
 
@@ -1744,14 +1843,14 @@ const Stage = styled(Panel)<{ $pinned: boolean }>`
   &:focus-within ${ZoomControlsWrap},
   &:hover ${PanControl},
   &:focus-within ${PanControl},
-  &:hover ${ActionBar},
-  &:focus-within ${ActionBar} {
+  &:hover ${ActionBarRow},
+  &:focus-within ${ActionBarRow} {
     opacity: 1;
   }
   &:hover ${TopOverlay},
   &:focus-within ${TopOverlay},
-  &:hover ${ActionBar},
-  &:focus-within ${ActionBar} {
+  &:hover ${ActionBarRow},
+  &:focus-within ${ActionBarRow} {
     pointer-events: auto;
   }
 
@@ -1762,7 +1861,7 @@ const Stage = styled(Panel)<{ $pinned: boolean }>`
         opacity: 1;
         pointer-events: auto;
       }
-      ${ActionBar} {
+      ${ActionBarRow} {
         opacity: 1;
         pointer-events: auto;
       }
@@ -1779,57 +1878,6 @@ const Empty = styled.div`
   font-style: italic;
   padding: 1rem;
   text-align: center;
-`;
-
-const OverlayIconButton = styled.button<{ $active?: boolean }>`
-  position: relative;
-  width: 24px;
-  height: 24px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0;
-  /* Active-toggle fill (quality / tracking / PiP / fullscreen / custom actions
-     all share this button). Its own token so a consumer can recolour just the
-     action-row highlight without touching the general accent; defaults to
-     --kerbcast-accent, so the sidecar web page (which maps its accent onto that)
-     is unchanged. */
-  background: ${(p) =>
-    p.$active
-      ? "var(--kerbcast-action-active, var(--kerbcast-accent, #00ff88))"
-      : "rgba(0, 0, 0, 0.5)"};
-  border: 1px solid
-    ${(p) =>
-      p.$active
-        ? "var(--kerbcast-action-active, var(--kerbcast-accent, #00ff88))"
-        : "rgba(255, 255, 255, 0.3)"};
-  border-radius: 3px;
-  color: ${(p) => (p.$active ? "#000" : "#fff")};
-  cursor: pointer;
-  transition: background 0.12s, border-color 0.12s, color 0.12s;
-
-  @media (hover: hover) {
-    &:hover {
-      background: ${(p) =>
-        p.$active
-          ? "var(--kerbcast-action-active, var(--kerbcast-accent, #00ff88))"
-          : "rgba(0, 0, 0, 0.7)"};
-      border-color: rgba(255, 255, 255, 0.6);
-    }
-  }
-
-  &:focus-visible {
-    outline: 2px solid var(--kerbcast-accent, #00ff88);
-    outline-offset: 2px;
-  }
-
-  &:disabled {
-    opacity: 0.4;
-  }
-
-  @media (prefers-reduced-motion: reduce) {
-    transition: none;
-  }
 `;
 
 const StyledVideo = styled.video`

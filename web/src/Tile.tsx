@@ -35,6 +35,13 @@ interface TileProps {
   onSelectCamera: (flightId: number) => void;
   onRemove: () => void;
   onToggleSpotlight: () => void;
+  /** REC+ grouped-recording selection mode: shows a checkbox overlay on every
+   *  bound tile (additive CSS, never remounts the feed) instead of the normal
+   *  chrome. */
+  selectionMode: boolean;
+  /** Whether this tile is currently selected for the pending grouped recording. */
+  selected: boolean;
+  onToggleSelect: () => void;
 }
 
 export function Tile({
@@ -49,6 +56,9 @@ export function Tile({
   onSelectCamera,
   onRemove,
   onToggleSpotlight,
+  selectionMode,
+  selected,
+  onToggleSelect,
 }: TileProps): React.JSX.Element {
   /*
    * Corner label: the name of the camera the feed actually displays, which
@@ -206,10 +216,29 @@ export function Tile({
           enablePictureInPicture
           enableQualityControl
           enableTracking
+          enableRecording
           actions={actions}
           trailingActions={trailingActions}
         />
       </FeedWrap>
+      {selectionMode && flightId !== null && (
+        <SelectionOverlay
+          type="button"
+          role="checkbox"
+          aria-checked={selected}
+          aria-label={
+            selected
+              ? `Deselect tile ${index + 1} for grouped recording`
+              : `Select tile ${index + 1} for grouped recording`
+          }
+          $selected={selected}
+          onClick={onToggleSelect}
+        >
+          <SelectionCheckbox $selected={selected}>
+            {selected && <Check size={14} strokeWidth={3} aria-hidden="true" />}
+          </SelectionCheckbox>
+        </SelectionOverlay>
+      )}
       {editing ? (
         <LabelEditor
           onSubmit={(e) => {
@@ -541,6 +570,46 @@ const FeedWrap = styled.div`
   & button[aria-label="Previous camera"] {
     display: none;
   }
+`;
+
+/*
+ * REC+ selection-mode overlay: an ADDITIVE sibling of FeedWrap, never a
+ * wrapper around it, so toggling selection mode never remounts the live
+ * CameraFeed underneath. Covers the whole tile so the operator can click
+ * anywhere on it to select/deselect, with a checkbox glyph in the corner.
+ */
+const SelectionOverlay = styled.button<{ $selected: boolean }>`
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  display: flex;
+  align-items: flex-start;
+  justify-content: flex-start;
+  padding: 0.5rem;
+  margin: 0;
+  border: none;
+  border-radius: inherit;
+  cursor: pointer;
+  background: ${(p) => (p.$selected ? "var(--kc-accent-wash)" : "transparent")};
+  box-shadow: ${(p) => (p.$selected ? "inset 0 0 0 2px var(--kc-accent)" : "none")};
+
+  &:focus-visible {
+    outline: 2px solid var(--kc-accent);
+    outline-offset: -2px;
+  }
+`;
+
+const SelectionCheckbox = styled.span<{ $selected: boolean }>`
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 4px;
+  border: 1.5px solid ${(p) => (p.$selected ? "var(--kc-accent)" : "rgba(255, 255, 255, 0.7)")};
+  background: ${(p) => (p.$selected ? "var(--kc-accent)" : "rgba(0, 0, 0, 0.35)")};
+  color: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
 `;
 
 /* Missing-camera placeholder: shown in place of the feed when the tile's

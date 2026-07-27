@@ -3,6 +3,7 @@ import { BrowserKerbcastTransport, KerbcastClient } from "@ksp-gonogo/kerbcast";
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { App } from "./App";
+import { loadLocalMediabunnyTrimmer } from "./mediabunnyAsset";
 
 async function bootstrap() {
   let client: KerbcastClient;
@@ -16,7 +17,7 @@ async function bootstrap() {
     const host = location.hostname;
     const port = location.port ? Number(location.port) : 8088;
     client = new KerbcastClient(
-      { host, port },
+      { host, port, recording: { loadTrimmer: loadLocalMediabunnyTrimmer } },
       new BrowserKerbcastTransport(),
     );
   }

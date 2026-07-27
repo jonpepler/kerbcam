@@ -27,3 +27,24 @@ export {
   type PanZoomBounds,
   type PanZoomControllerOptions,
 } from "./panZoom";
+
+export {
+  RecordingController,
+  createMediabunnyTrimmerLoader,
+  negotiateMimeType,
+  commonUtWindow,
+  utToRecordingTimeMs,
+  DEFAULT_COVERAGE_TIMEOUT_MS,
+  type ActiveRecordingInfo,
+  type RecordingClient,
+  type RecordingControllerOptions,
+  type RecordingHandle,
+  type RecordingsSnapshot,
+  type GroupedRecordingHandle,
+  type GroupedRecordingStart,
+  type GroupTrimmer,
+  type TrimmerLoader,
+  type UtSample,
+  type StartRecordingOptions,
+  type StopGroupedRecordingOptions,
+} from "./recording";

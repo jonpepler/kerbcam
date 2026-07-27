@@ -20,7 +20,8 @@
 import { useEffect, useRef, useState } from "react";
 import styled from "styled-components";
 
-import { FeedAction, CameraStreamHook } from "./CameraFeed";
+import { CameraStreamHook, FeedAction } from "./CameraFeed";
+import { FeedActionBar, feedActionToEntry } from "./FeedActionBar";
 import { useKerbcastStream } from "./hooks/useKerbcastStream";
 import { useKerbcastCameras } from "./hooks/useKerbcastCameras";
 import { useReportDisplaySize } from "./hooks/useReportDisplaySize";
@@ -131,27 +132,18 @@ const OverlayLayer = styled.div`
   inset: 0;
 `;
 
-const ActionBar = styled.div`
-  position: absolute;
+/*
+ * The shared FeedActionBar is hover-revealed by default (CameraFeed's larger
+ * frame fades it in on hover/focus). A tiny face tile has no such affordance,
+ * so this override keeps the original always-visible, corner-hugging look;
+ * layout/button styling (flex row, gap, the shared OverlayIconButton) still
+ * comes from FeedActionBar itself.
+ */
+const KerbalActionBarRow = styled(FeedActionBar)`
   top: 4px;
   right: 4px;
-  display: flex;
-  gap: 4px;
-  z-index: 2;
-`;
-
-const ActionButton = styled.button<{ $active?: boolean }>`
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 22px;
-  height: 22px;
-  padding: 0;
-  border: none;
-  border-radius: 3px;
-  cursor: pointer;
-  color: #fff;
-  background: ${(p) => (p.$active ? "rgba(255,255,255,0.28)" : "rgba(0,0,0,0.45)")};
+  opacity: 1;
+  pointer-events: auto;
 `;
 
 export function KerbalFaceFeed({
@@ -214,21 +206,7 @@ export function KerbalFaceFeed({
         </StandbyLayer>
       )}
       {showActions && actions && actions.length > 0 && (
-        <ActionBar>
-          {actions.map((a) => (
-            <ActionButton
-              key={a.id}
-              type="button"
-              aria-label={a.label}
-              title={a.label}
-              aria-pressed={a.active}
-              $active={a.active}
-              onClick={a.onClick}
-            >
-              {a.icon}
-            </ActionButton>
-          ))}
-        </ActionBar>
+        <KerbalActionBarRow entries={actions.map(feedActionToEntry)} />
       )}
       {children && <OverlayLayer>{children}</OverlayLayer>}
     </Frame>

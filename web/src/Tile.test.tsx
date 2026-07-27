@@ -78,7 +78,13 @@ async function buildConnectedFixture(cameras: MockCameraInit[] = []) {
 function renderTile(
   client: KerbcastClient,
   flightId: number | null,
-  opts: { mergeCrew?: boolean; onSelectCamera?: (id: number) => void } = {},
+  opts: {
+    mergeCrew?: boolean;
+    onSelectCamera?: (id: number) => void;
+    selectionMode?: boolean;
+    selected?: boolean;
+    onToggleSelect?: () => void;
+  } = {},
 ) {
   return render(
     <KerbcastProvider client={client}>
@@ -93,6 +99,9 @@ function renderTile(
         onSelectCamera={opts.onSelectCamera ?? (() => {})}
         onRemove={() => {}}
         onToggleSpotlight={() => {}}
+        selectionMode={opts.selectionMode ?? false}
+        selected={opts.selected ?? false}
+        onToggleSelect={opts.onToggleSelect ?? (() => {})}
       />
     </KerbcastProvider>,
   );
@@ -201,5 +210,116 @@ describe("Tile - camera picker excludes crew when merge is OFF", () => {
     // No crew option was ever selectable, so the "picking crew drops a tile"
     // side effect cannot occur.
     expect(screen.queryByRole("menuitemradio", { name: /jebediah/i })).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// REC+ selection mode: checkbox overlay, additive only (never remounts the feed)
+// ---------------------------------------------------------------------------
+
+describe("Tile - REC+ selection mode", () => {
+  it("shows no selection checkbox when selectionMode is off", async () => {
+    const { client } = await buildConnectedFixture([
+      makeCamera({ flightId: 1, cameraName: "Alpha" }),
+    ]);
+    await act(async () => { renderTile(client, 1); });
+
+    expect(screen.queryByRole("checkbox")).toBeNull();
+  });
+
+  it("shows an unchecked selection checkbox when selectionMode is on", async () => {
+    const { client } = await buildConnectedFixture([
+      makeCamera({ flightId: 1, cameraName: "Alpha" }),
+    ]);
+    await act(async () => { renderTile(client, 1, { selectionMode: true, selected: false }); });
+
+    const cb = screen.getByRole("checkbox") as HTMLInputElement;
+    expect(cb).toBeTruthy();
+    expect(cb.getAttribute("aria-checked")).toBe("false");
+  });
+
+  it("reflects selected=true as aria-checked", async () => {
+    const { client } = await buildConnectedFixture([
+      makeCamera({ flightId: 1, cameraName: "Alpha" }),
+    ]);
+    await act(async () => { renderTile(client, 1, { selectionMode: true, selected: true }); });
+
+    const cb = screen.getByRole("checkbox");
+    expect(cb.getAttribute("aria-checked")).toBe("true");
+  });
+
+  it("clicking the checkbox calls onToggleSelect", async () => {
+    const onToggleSelect = vi.fn();
+    const { client } = await buildConnectedFixture([
+      makeCamera({ flightId: 1, cameraName: "Alpha" }),
+    ]);
+    await act(async () => {
+      renderTile(client, 1, { selectionMode: true, onToggleSelect });
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("checkbox"));
+    });
+    expect(onToggleSelect).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers no checkbox for an empty (flightId null) slot", async () => {
+    const { client } = await buildConnectedFixture([]);
+    await act(async () => { renderTile(client, null, { selectionMode: true }); });
+
+    expect(screen.queryByRole("checkbox")).toBeNull();
+  });
+
+  it("never remounts the live feed's video element when selection mode toggles", async () => {
+    const { client } = await buildConnectedFixture([
+      makeCamera({ flightId: 1, cameraName: "Alpha" }),
+    ]);
+
+    function Wrapped({ selectionMode }: { selectionMode: boolean }) {
+      return (
+        <KerbcastProvider client={client}>
+          <Tile
+            flightId={1}
+            index={0}
+            showDebugInfo={false}
+            showStatic={false}
+            spotlit={false}
+            mergeCrew={true}
+            onSelectCamera={() => {}}
+            onRemove={() => {}}
+            onToggleSpotlight={() => {}}
+            selectionMode={selectionMode}
+            selected={false}
+            onToggleSelect={() => {}}
+          />
+        </KerbcastProvider>
+      );
+    }
+
+    let r: ReturnType<typeof render>;
+    await act(async () => { r = render(<Wrapped selectionMode={false} />); });
+    const before = r!.container.querySelector("video");
+    expect(before).not.toBeNull();
+
+    await act(async () => { r!.rerender(<Wrapped selectionMode={true} />); });
+    const after = r!.container.querySelector("video");
+
+    expect(after).not.toBeNull();
+    expect(after).toBe(before);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Per-feed REC control is always enabled on this page
+// ---------------------------------------------------------------------------
+
+describe("Tile - per-feed recording", () => {
+  it("shows a REC control in the feed's action bar", async () => {
+    const { client } = await buildConnectedFixture([
+      makeCamera({ flightId: 1, cameraName: "Alpha" }),
+    ]);
+    await act(async () => { renderTile(client, 1); });
+
+    expect(screen.getByRole("button", { name: /start recording/i })).toBeTruthy();
   });
 });

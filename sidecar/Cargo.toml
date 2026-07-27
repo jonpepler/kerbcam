@@ -106,3 +106,6 @@ pkg-config = "0.3"
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
 tempfile = "3"
+# ServiceExt::oneshot, for driving the axum router directly in signalling
+# tests without binding a real TCP listener.
+tower = { version = "0.5", features = ["util"] }

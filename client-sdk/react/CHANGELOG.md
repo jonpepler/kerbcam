@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased (next minor)
+
+### Added
+
+- `useRecordings`: a reactive recordings store over the SDK's
+  `client.recording` controller. Exposes finished standalone clips
+  (`recordings`), synchronised sets (`groups`), and in-progress recordings
+  (`active`, for a REC dot + elapsed timer), plus `start` / `stop` /
+  `startGroup` / `stopGroup` / `discard` / `discardGroup` / `isRecording`. This
+  is the headless data layer the recordings tray + REC controls sit on; it owns
+  no chrome and keeps grouped clips out of the singles list
+- `RecordingsStore` and `ActiveRecordingInfo` types
+
 ## 1.7.0 - 2026-07-24
 
 Crew face cameras, auto-resolution, and camera targeting.

@@ -1,7 +1,10 @@
 # Ignore all build output in dist/ except the pre-built self-contained page
-# that the sidecar binary embeds via include_str!. The built file is committed
-# so cargo builds need no Node toolchain.
+# and the Mediabunny trim asset, both of which the sidecar binary embeds via
+# include_str!. Both are committed so cargo builds need no Node toolchain.
 dist/*
 !dist/index.html
+!dist/assets
+dist/assets/*
+!dist/assets/mediabunny.min.mjs
 
 node_modules/

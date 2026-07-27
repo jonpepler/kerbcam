@@ -27,6 +27,11 @@ export { useKerbcastStream } from "./hooks/useKerbcastStream";
 export { useKerbcastClock } from "./hooks/useKerbcastClock";
 export { useKerbcastInFlight } from "./hooks/useKerbcastInFlight";
 export { useReportDisplaySize } from "./hooks/useReportDisplaySize";
+export { useRecordings } from "./hooks/useRecordings";
+export type { RecordingsStore, ActiveRecordingInfo } from "./hooks/useRecordings";
+
+// Shared elapsed-timer helpers (REC badges, RecGroupBar's toolbar)
+export { nowMs, formatElapsed } from "./timing";
 
 // Shared standby glyph (used by CameraFeed + downstream dashboards)
 export { StandbyIcon } from "./StandbyIcon";
@@ -48,6 +53,16 @@ export type {
   FeedAction,
 } from "./CameraFeed";
 
+// FeedActionBar: the shared action row (tracking, fullscreen, PiP, quality,
+// close, REC) both CameraFeed and KerbalFaceFeed render, with the issue-#6
+// overflow (⋮) engine.
+export { FeedActionBar } from "./FeedActionBar";
+export type { FeedActionBarEntry } from "./FeedActionBar";
+
 // KerbalFaceFeed — shared single-kerbal-face primitive
 export { KerbalFaceFeed } from "./KerbalFaceFeed";
 export type { KerbalFaceFeedProps, KerbalFeedState } from "./KerbalFaceFeed";
+
+// RecordingsTray: a presentational drawer over the recordings store
+export { RecordingsTray } from "./RecordingsTray";
+export type { RecordingsTrayProps } from "./RecordingsTray";

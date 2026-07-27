@@ -10,6 +10,13 @@
 //!   failing the whole request.
 //! - `GET /` serves the bundled kerbcast web UI (web/dist/index.html,
 //!   embedded at compile time via include_str!).
+//! - `GET /assets/mediabunny.min.mjs` serves the Mediabunny remux-trim
+//!   package the web page's grouped-recording flow dynamic-imports (also
+//!   embedded at compile time, from web/dist/assets/mediabunny.min.mjs --
+//!   see web/vite.config.ts's copyMediabunnyAsset step). Kept out of
+//!   index.html's own single-file bundle so a page load that never touches
+//!   grouped recording never pays for it; served locally so the trim works
+//!   offline/LAN with no CDN.
 //!
 //! Per-camera operational state (layer mask, render size, future zoom)
 //! is no longer exposed over HTTP — it's owned by the data channel
@@ -84,6 +91,7 @@ pub struct DumpLogsResponse {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(serve_index))
+        .route("/assets/mediabunny.min.mjs", get(serve_mediabunny))
         .route("/health", get(health))
         .route("/cameras", get(cameras))
         .route("/offer", post(offer))
@@ -109,6 +117,17 @@ async fn serve_index() -> impl IntoResponse {
         StatusCode::OK,
         [("content-type", "text/html; charset=utf-8")],
         include_str!("../../web/dist/index.html"),
+    )
+}
+
+/// Serves the Mediabunny bundle the embedded page's grouped-recording trim
+/// dynamic-imports (`web/src/mediabunnyAsset.ts`). Mirrors `serve_index`:
+/// embedded at compile time, no filesystem read at request time.
+async fn serve_mediabunny() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [("content-type", "text/javascript; charset=utf-8")],
+        include_str!("../../web/dist/assets/mediabunny.min.mjs"),
     )
 }
 
@@ -238,4 +257,92 @@ async fn handle_offer(state: AppState, req: OfferRequest) -> anyhow::Result<Answ
         sdp: answer_sdp,
         cameras: subscribed,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    use super::*;
+
+    /// An `AppState` with no attached cameras or peers -- enough to exercise
+    /// the static routes (`/`, `/assets/mediabunny.min.mjs`, `/health`),
+    /// which read no registry/peer state.
+    fn empty_state() -> AppState {
+        AppState {
+            registry: Arc::new(CameraRegistry::new(PathBuf::from("/tmp"))),
+            peers: Arc::new(RwLock::new(Vec::new())),
+            encoder_choice: EncoderChoice::Auto,
+            fps: 30,
+            bitrate_bps: 2_000_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn serves_mediabunny_with_the_right_content_type_and_a_nonempty_body() {
+        let app = router(empty_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/mediabunny.min.mjs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .expect("content-type header")
+            .to_str()
+            .unwrap();
+        assert!(
+            content_type.starts_with("text/javascript"),
+            "unexpected content-type: {content_type}",
+        );
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        // The real pre-minified Mediabunny bundle is several hundred KB; a
+        // missing/truncated embed would be nowhere close, so this also
+        // guards against an accidentally-empty include_str!.
+        assert!(
+            body.len() > 400_000,
+            "expected the real Mediabunny bundle, got {} bytes",
+            body.len(),
+        );
+    }
+
+    #[tokio::test]
+    async fn serves_index_html_at_the_root() {
+        let app = router(empty_state());
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .expect("content-type header")
+            .to_str()
+            .unwrap();
+        assert!(content_type.starts_with("text/html"));
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(!body.is_empty());
+        // index.html must stay lean: nowhere near Mediabunny's own bundle
+        // size, i.e. it was never inlined into the single-file page.
+        assert!(
+            body.len() < 500_000,
+            "index.html grew to {} bytes -- did Mediabunny get inlined?",
+            body.len(),
+        );
+    }
 }

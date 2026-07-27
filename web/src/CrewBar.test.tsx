@@ -163,7 +163,8 @@ describe("CrewBar", () => {
 
     await act(async () => { renderCrewBar(client, { onClose }); });
 
-    // The close action is the primitive's action button labelled "Close".
+    // Close is the shared FeedActionBar's pinned-trailing slot: always
+    // visible, never swept behind the ⋮ overflow, so it's reachable directly.
     const closeButtons = screen.getAllByRole("button", { name: /^close$/i });
     await act(async () => { fireEvent.click(closeButtons[0]); });
     expect(onClose).toHaveBeenCalled();
@@ -181,16 +182,23 @@ describe("CrewBar", () => {
     expect(screen.getByText(/add crew/i)).toBeTruthy();
   });
 
-  it("offers visible spotlight / fullscreen / PiP / close controls per face", async () => {
+  it("offers visible spotlight / fullscreen / PiP / close controls per face, with no ⋮ overflow", async () => {
     const { client } = await buildConnectedFixture([
       { flightId: 201, kind: CameraKind.Kerbal, crewLocation: CrewLocation.Seat, cameraName: "Jebediah Kerman" },
     ]);
     await act(async () => { renderCrewBar(client); });
 
+    // Spotlight is a stateful toggle (active !== undefined): primary/inline.
+    // Close is the shared FeedActionBar's pinned-trailing slot: excluded from
+    // the overflow-threshold count entirely, so it's directly visible too.
+    // That leaves fullscreen/PiP (2 non-stateful, non-pinned) as the only
+    // overflow-eligible set -- below the >=4-total threshold on their own --
+    // so the row never crosses it and there is no ⋮ trigger at all.
     expect(screen.getByRole("button", { name: /spotlight this feed/i })).toBeTruthy();
-    expect(screen.getByRole("button", { name: /fullscreen/i })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^fullscreen$/i })).toBeTruthy();
     expect(screen.getByRole("button", { name: /picture in picture/i })).toBeTruthy();
     expect(screen.getByRole("button", { name: /^close$/i })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /^more actions$/i })).toBeNull();
   });
 
   it("clicking spotlight requests the toggle for that face's flightId", async () => {
@@ -302,6 +310,9 @@ describe("merge (crew in the regular grid)", () => {
             onTilesChange={() => {}}
             showDebugInfo={false}
             showStatic={false}
+            selectionMode={false}
+            selectedFlightIds={new Set()}
+            onToggleSelect={() => {}}
           />
         </KerbcastProvider>,
       ));
@@ -326,6 +337,9 @@ describe("merge (crew in the regular grid)", () => {
             onTilesChange={() => {}}
             showDebugInfo={false}
             showStatic={false}
+            selectionMode={false}
+            selectedFlightIds={new Set()}
+            onToggleSelect={() => {}}
           />
         </KerbcastProvider>,
       );

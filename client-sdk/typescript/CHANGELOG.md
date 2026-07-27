@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased (next minor)
+
+Client-side camera recording (pure SDK; no sidecar/plugin/protocol change).
+
+### Added
+
+- `KerbcastClient.recording`: a `RecordingController` that records a camera's
+  already-received WebRTC track with the browser's `MediaRecorder`, entirely
+  client-local (the sidecar never learns a recording happened)
+- Per-feed API: `startRecording(flightId, opts?)` returns a client-minted
+  `recordingId`; `stopRecording(recordingId)` resolves a `RecordingHandle`;
+  `fetchRecording` / `discardRecording` / `isRecording`
+- `RecordingHandle = { recordingId, blob, mimeType, utStart?, utEnd?,
+  utSamples, byteSize, durationMs }`, where `utSamples` is a ~1Hz
+  (recording-time, UT) series so a consumer can interpolate any frame's
+  mission-time near-frame-tight; out of flight it falls back to wall-clock
+  timing (`ut` absent) and upgrades automatically once UT appears
+- Mime negotiation prefers `video/mp4;codecs=avc1` where
+  `MediaRecorder.isTypeSupported`, else `video/webm;codecs=vp9`, else
+  `video/webm`; the chosen type is on the handle. `opts.maxDurationMs` auto-stops
+- Grouped API: `startGroupedRecording(flightIds, opts?)` (all recorders open in
+  one tick) and `stopGroupedRecording(groupId, { targetUt? })`. `targetUt`
+  enforces a coverage guarantee: finalization waits until every feed's latest
+  UT sample passes it, so no feed falls short of the common window
+- `GroupedRecordingHandle = { groupId, recordings, commonUtWindow? }`, where
+  `commonUtWindow` is the intersection of the feeds' `[utStart, utEnd]`
+- Grouped clips are physically remux-trimmed to `commonUtWindow` by default
+  (keyframe-boundary cut, no re-encode) via a lazily `import()`-ed Mediabunny,
+  loaded only on grouped-record start (single recordings stay dependency-free);
+  a clip that can't be cut cleanly (webm, or a remux error) degrades to
+  metadata-only and never fails the recording. `utSamples` + `commonUtWindow`
+  still ride along after trimming so a consumer can align to telemetry
+- Helpers `negotiateMimeType`, `commonUtWindow`, `utToRecordingTimeMs`
+- `StubMediaRecorder`: a jsdom `MediaRecorder` shim installed by
+  `installDomStubs`, so the full record -> UT-sample -> stop -> handle path is
+  headless-testable (its `isTypeSupported` is controllable for mime tests)
+- `mediabunny` as a dependency, dynamically imported for grouped-clip trimming
+  only (never pulled by single recordings or non-recording consumers)
+
 ## 1.7.0 - 2026-07-24
 
 Crew face cameras, auto-resolution, and camera targeting.

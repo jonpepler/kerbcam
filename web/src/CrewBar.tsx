@@ -192,6 +192,10 @@ function CrewFace({ cam, spotlit, onToggleSpotlight, onClose }: CrewFaceProps): 
         label: "Close",
         icon: <X size={13} strokeWidth={2} aria-hidden="true" />,
         onClick: onClose,
+        // Pinned trailing: never overflow-eligible, always the rightmost,
+        // persistent, single-click control (excluded from the overflow
+        // threshold count entirely).
+        pinnedTrailing: true,
       },
     ],
     [spotlit, onToggleSpotlight, onClose],

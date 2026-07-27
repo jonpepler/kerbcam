@@ -11,6 +11,7 @@ import type {
 } from "./__generated__/types";
 import { CameraLifecycle, ErrorSource } from "./__generated__/types";
 import { type NoisePipeline, tryCreateNoisePipeline } from "./noise";
+import { RecordingController, type RecordingControllerOptions } from "./recording";
 
 /** Intensity the static runs at when a camera has no live source (signal lost). */
 const SOURCELESS_INTENSITY = 1.0;
@@ -150,6 +151,15 @@ export interface KerbcastClientConfig {
     cameras: number[];
     slots?: number;
   }) => Promise<{ sdp: string; cameras: number[] }>;
+  /**
+   * Options for the lazily-built {@link RecordingController} (`client.recording`).
+   * The load-bearing use is `loadTrimmer`: a consumer that can't rely on the
+   * default bare `import("mediabunny")` resolving (the sidecar's embedded web
+   * page serves its own copy of the package locally, offline/LAN, no CDN)
+   * supplies its own loader here. Bundler consumers (e.g. gonogo) can omit
+   * this and get the default.
+   */
+  recording?: RecordingControllerOptions;
 }
 
 /** WebRTC connection state surface. */
@@ -816,6 +826,8 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   private _warpRate = 1;
   /** Whether KSP is in a flight scene. `undefined` until the first signal. */
   private _inFlight: boolean | undefined = undefined;
+  /** Client-side recording controller, lazily built on first `recording` access. */
+  private _recording: RecordingController | null = null;
 
   constructor(cfg: KerbcastClientConfig, transport?: KerbcastTransport) {
     super();
@@ -866,6 +878,17 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
       epoch: this._captureEpoch,
       warpRate: this._warpRate,
     };
+  }
+
+  /**
+   * Client-side recording controller. Records a camera's already-received
+   * track with the browser's `MediaRecorder`, annotated with the mission-time
+   * (UT) clock; purely local, no sidecar involvement. Lazily created on first
+   * access and stable thereafter. See {@link RecordingController}.
+   */
+  get recording(): RecordingController {
+    if (!this._recording) this._recording = new RecordingController(this, this.cfg.recording);
+    return this._recording;
   }
 
   /**

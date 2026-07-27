@@ -676,6 +676,15 @@ export function installDomStubs(): void {
   // tests (getTracks, addTrack, id).
   installStubMediaStream();
 
+  // MediaRecorder: jsdom ships none, so the recording controller can't be
+  // exercised headlessly without it. The stub emits one canned Blob on stop,
+  // closing the start -> stop -> Blob path. Its isTypeSupported is controllable
+  // (StubMediaRecorder.supportedTypes) so tests can drive mime negotiation and
+  // its fallback.
+  if (typeof (globalThis as { MediaRecorder?: unknown }).MediaRecorder === "undefined") {
+    (globalThis as { MediaRecorder?: unknown }).MediaRecorder = StubMediaRecorder;
+  }
+
   // play: jsdom's HTMLMediaElement.play is not implemented and prints a warning.
   // The noise pipeline awaits video.play() on its internal video element.
   if (typeof HTMLMediaElement !== "undefined") {
@@ -737,4 +746,79 @@ function installStubMediaStream(): void {
     // Fall through to install the stub.
   }
   (globalThis as unknown as { MediaStream: unknown }).MediaStream = StubMediaStream;
+}
+
+/**
+ * Minimal MediaRecorder stand-in for jsdom, installed by {@link installDomStubs}.
+ *
+ * jsdom implements no MediaRecorder, so the recording controller can't run
+ * headlessly without this. On `stop()` it synchronously flushes one canned
+ * Blob (a fixed byte pattern tagged with the negotiated mimeType) then fires
+ * `stop`, closing the start -> stop -> Blob path the controller drives.
+ *
+ * `isTypeSupported` is controllable so tests exercise mime negotiation:
+ *   - `supportedTypes = null` (default): support everything, so negotiation
+ *     picks the mp4 preference.
+ *   - `supportedTypes = ["video/webm"]`: force the webm fallback.
+ * Reset `supportedTypes` back to null between tests that change it.
+ */
+export class StubMediaRecorder {
+  /** Types isTypeSupported reports available; null = everything. */
+  static supportedTypes: string[] | null = null;
+
+  static isTypeSupported(type: string): boolean {
+    return StubMediaRecorder.supportedTypes === null
+      ? true
+      : StubMediaRecorder.supportedTypes.includes(type);
+  }
+
+  readonly stream: MediaStream;
+  readonly mimeType: string;
+  state: "inactive" | "recording" | "paused" = "inactive";
+
+  private readonly _listeners = new Map<string, Set<(e: { data?: Blob }) => void>>();
+
+  constructor(stream: MediaStream, options?: { mimeType?: string }) {
+    this.stream = stream;
+    this.mimeType = options?.mimeType ?? "";
+  }
+
+  addEventListener(type: string, cb: (e: { data?: Blob }) => void): void {
+    let set = this._listeners.get(type);
+    if (!set) {
+      set = new Set();
+      this._listeners.set(type, set);
+    }
+    set.add(cb);
+  }
+
+  removeEventListener(type: string, cb: (e: { data?: Blob }) => void): void {
+    this._listeners.get(type)?.delete(cb);
+  }
+
+  private _emit(type: string, e: { data?: Blob }): void {
+    this._listeners.get(type)?.forEach((cb) => cb(e));
+  }
+
+  start(_timeslice?: number): void {
+    this.state = "recording";
+  }
+
+  /** Flush a canned data chunk, then fire `stop`, mirroring the real order. */
+  stop(): void {
+    if (this.state === "inactive") return;
+    this.state = "inactive";
+    const bytes = new Uint8Array(2048);
+    for (let i = 0; i < bytes.length; i++) bytes[i] = i & 0xff;
+    const data = new Blob([bytes], { type: this.mimeType || "video/webm" });
+    this._emit("dataavailable", { data });
+    this._emit("stop", {});
+  }
+
+  /** Emit a partial data chunk without stopping (matches the real API). */
+  requestData(): void {
+    if (this.state !== "recording") return;
+    const data = new Blob([new Uint8Array(512)], { type: this.mimeType || "video/webm" });
+    this._emit("dataavailable", { data });
+  }
 }

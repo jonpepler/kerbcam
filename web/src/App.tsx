@@ -9,9 +9,12 @@ import { DevPanel } from "./DevPanel";
 import { ErrorToast } from "./ErrorToast";
 import { Grid } from "./Grid";
 import { Header } from "./Header";
+import { RecGroupBar } from "./RecGroupBar";
+import { RecordingsPanel } from "./RecordingsPanel";
 import { Settings } from "./SettingsPanel";
 import { ShedBanner } from "./ShedBanner";
 import { StandbyOverlay } from "./StandbyOverlay";
+import { useRecordingsUnloadGuard } from "./useRecordingsUnloadGuard";
 import {
   applyTheme,
   loadClosedCrew,
@@ -81,6 +84,54 @@ export function App({ client }: AppProps): React.JSX.Element {
       : !window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   const [showPerfWarnings, setShowPerfWarnings] = useState<boolean>(() => loadShowPerfWarnings());
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [recordingsOpen, setRecordingsOpen] = useState(false);
+  const toggleSettings = useCallback(() => {
+    setRecordingsOpen(false);
+    setSettingsOpen((v) => !v);
+  }, []);
+  const toggleRecordings = useCallback(() => {
+    setSettingsOpen(false);
+    setRecordingsOpen((v) => !v);
+  }, []);
+
+  /*
+   * REC+ grouped recording: `recSelectMode` + `selectedFlightIds` drive the
+   * Grid/Tile checkbox overlay (see Tile's own doc-comment); `activeGroupId`
+   * is lifted here (not owned by RecGroupBar) so the Header can disable REC+
+   * while a group is already recording. RecGroupBar itself owns the actual
+   * store calls (startGroup/stopGroup) since it renders inside the provider.
+   */
+  const [recSelectMode, setRecSelectMode] = useState(false);
+  const [selectedFlightIds, setSelectedFlightIds] = useState<ReadonlySet<number>>(new Set());
+  const [activeGroupId, setActiveGroupId] = useState<string | null>(null);
+
+  const toggleRecSelectMode = useCallback(() => {
+    setRecSelectMode((v) => {
+      const next = !v;
+      if (!next) setSelectedFlightIds(new Set());
+      return next;
+    });
+  }, []);
+  const cancelRecSelection = useCallback(() => {
+    setRecSelectMode(false);
+    setSelectedFlightIds(new Set());
+  }, []);
+  const toggleTileSelected = useCallback((flightId: number) => {
+    setSelectedFlightIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(flightId)) next.delete(flightId);
+      else next.add(flightId);
+      return next;
+    });
+  }, []);
+  const handleGroupStarted = useCallback((groupId: string) => {
+    setActiveGroupId(groupId);
+    setRecSelectMode(false);
+    setSelectedFlightIds(new Set());
+  }, []);
+  const handleGroupStopped = useCallback(() => {
+    setActiveGroupId(null);
+  }, []);
 
   // Crew settings. Placement + merge persist; minimise is transient (a bar
   // control, resets on reload). Merge OFF (default): kerbal cams are filtered
@@ -129,11 +180,17 @@ export function App({ client }: AppProps): React.JSX.Element {
 
   return (
     <KerbcastProvider client={client}>
+      <UnloadGuard />
       <PageShell>
         <Header
           status={status}
           client={client}
-          onOpenSettings={() => setSettingsOpen((v) => !v)}
+          onOpenSettings={toggleSettings}
+          recordingsOpen={recordingsOpen}
+          onToggleRecordings={toggleRecordings}
+          recSelectMode={recSelectMode}
+          onToggleRecSelectMode={toggleRecSelectMode}
+          recordingGroupActive={activeGroupId !== null}
         />
         {settingsOpen && (
           <Settings
@@ -152,6 +209,15 @@ export function App({ client }: AppProps): React.JSX.Element {
             onClose={() => setSettingsOpen(false)}
           />
         )}
+        {recordingsOpen && <RecordingsPanel onClose={() => setRecordingsOpen(false)} />}
+        <RecGroupBar
+          active={recSelectMode}
+          selectedFlightIds={selectedFlightIds}
+          groupId={activeGroupId}
+          onCancel={cancelRecSelection}
+          onStarted={handleGroupStarted}
+          onStopped={handleGroupStopped}
+        />
         {showPerfWarnings && <ShedBanner client={client} />}
         <ErrorToast client={client} />
         <MainArea>
@@ -180,6 +246,9 @@ export function App({ client }: AppProps): React.JSX.Element {
                 onTilesChange={setTiles}
                 showDebugInfo={debug}
                 showStatic={showStatic}
+                selectionMode={recSelectMode}
+                selectedFlightIds={selectedFlightIds}
+                onToggleSelect={toggleTileSelected}
               />
               {debug && (
                 <DevPanel client={client} tileFlightIds={tileFlightIds} />
@@ -206,6 +275,18 @@ export function App({ client }: AppProps): React.JSX.Element {
       </PageShell>
     </KerbcastProvider>
   );
+}
+
+// ---------------------------------------------------------------------------
+// UnloadGuard: warns before a reload/close while unsaved recordings exist
+// ---------------------------------------------------------------------------
+
+/* useRecordingsUnloadGuard reads useRecordings(), which needs a
+   KerbcastProvider ancestor -- a bare hook call, same pattern as
+   CameraSeeder/CameraReconciler below. */
+function UnloadGuard(): null {
+  useRecordingsUnloadGuard();
+  return null;
 }
 
 // ---------------------------------------------------------------------------

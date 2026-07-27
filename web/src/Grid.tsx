@@ -29,11 +29,24 @@ interface GridProps {
   onTilesChange: (tiles: TileData[]) => void;
   showDebugInfo: boolean;
   showStatic: boolean;
+  /** REC+ grouped-recording selection mode (see Tile's own doc-comment). */
+  selectionMode: boolean;
+  selectedFlightIds: ReadonlySet<number>;
+  onToggleSelect: (flightId: number) => void;
 }
 
 const GAP = 16; // 1rem; keep in sync with Root `gap`
 
-export function Grid({ mergeCrew, tiles, onTilesChange, showDebugInfo, showStatic }: GridProps): React.JSX.Element {
+export function Grid({
+  mergeCrew,
+  tiles,
+  onTilesChange,
+  showDebugInfo,
+  showStatic,
+  selectionMode,
+  selectedFlightIds,
+  onToggleSelect,
+}: GridProps): React.JSX.Element {
   // Merge OFF: kerbal face cams live in the crew bar, so the grid's seeding /
   // add-all / missing-count / reconcile never pull one in. Merge ON: kerbal cams
   // are regular grid cameras, indistinguishable from part cams. Part-camera grid
@@ -172,6 +185,11 @@ export function Grid({ mergeCrew, tiles, onTilesChange, showDebugInfo, showStati
           onSelectCamera={(fid) => handleSelectCamera(i, fid)}
           onRemove={() => handleRemove(i)}
           onToggleSpotlight={() => handleToggleSpotlight(i)}
+          selectionMode={selectionMode}
+          selected={tile.flightId !== null && selectedFlightIds.has(tile.flightId)}
+          onToggleSelect={() => {
+            if (tile.flightId !== null) onToggleSelect(tile.flightId);
+          }}
         />
       ))}
       <AddControls $bar={flatFill}>

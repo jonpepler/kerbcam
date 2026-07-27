@@ -14,6 +14,7 @@
 import { CameraKind, CameraLifecycle, CrewLocation, KerbcastClient } from "@ksp-gonogo/kerbcast";
 import type { MockCameraInit } from "@ksp-gonogo/kerbcast/testing";
 import { MockSidecar } from "@ksp-gonogo/kerbcast/testing";
+import { loadLocalMediabunnyTrimmer } from "../mediabunnyAsset";
 
 const MOCK_CAMERAS: MockCameraInit[] = [
   {
@@ -237,6 +238,7 @@ export async function createMockClient(): Promise<KerbcastClient> {
     {
       host: "mock",
       port: 0,
+      recording: { loadTrimmer: loadLocalMediabunnyTrimmer },
       negotiate: async (offer) => {
         const answer = await sidecar.negotiate(offer);
         /*
@@ -257,6 +259,33 @@ export async function createMockClient(): Promise<KerbcastClient> {
 
   // Intercept /profile before the app's DevPanel starts polling
   interceptProfileFetch();
+
+  /*
+   * Record -> replay dev hook. Closes the loop the recording SDK opens: a
+   * recorded Blob (client.recording.stopRecording(...).blob) is turned back
+   * into a live track and delivered onto that camera's slot, so ?mock=1 can
+   * exercise capture-then-play-back without a real sidecar. deliverTrack is
+   * the existing replay half; buildReplayTrack is the Blob -> <video> ->
+   * captureStream front half. Exposed on window for manual/dev use and the
+   * (deferred) recordings-tray inline preview.
+   */
+  const replayTracks = new Map<number, MediaStreamTrack>();
+  (globalThis as unknown as { __kerbcastMockReplay?: unknown }).__kerbcastMockReplay = (
+    flightId: number,
+    blob: Blob,
+  ): boolean => {
+    const mid = sidecar.slotMidFor(flightId);
+    if (!mid) return false;
+    /* Stop this slot's previous replay track (if any) before swapping in the
+       new one: that fires the old track's "ended", which is what revokes its
+       object URL (see buildReplayTrack). Without this, replaying a second
+       clip onto the same camera would abandon the first blob URL forever. */
+    replayTracks.get(flightId)?.stop();
+    const track = buildReplayTrack(blob);
+    replayTracks.set(flightId, track);
+    sidecar.deliverTrack(mid, track);
+    return true;
+  };
 
   // Periodic state variation
   setInterval(() => {
@@ -313,6 +342,37 @@ function buildCanvasTrack(label: string, hue: number, width = 640, height = 360)
   const stream = (canvas as HasCaptureStream).captureStream(24);
   const track = stream.getVideoTracks()[0];
   if (!track) throw new Error("captureStream returned no video tracks");
+  return track;
+}
+
+// ---------------------------------------------------------------------------
+// Record -> replay: Blob back to a live track
+// ---------------------------------------------------------------------------
+
+/**
+ * Turn a recorded Blob back into a live MediaStreamTrack: object-URL it onto a
+ * looping muted <video>, then captureStream() the element. The returned track
+ * is what {@link MockSidecar.deliverTrack} feeds onto a slot to replay a clip.
+ * Browser-only (needs real HTMLMediaElement.captureStream).
+ */
+export function buildReplayTrack(blob: Blob): MediaStreamTrack {
+  const url = URL.createObjectURL(blob);
+  const video = document.createElement("video");
+  video.src = url;
+  video.loop = true;
+  video.muted = true;
+  video.autoplay = true;
+  void video.play().catch(() => {});
+
+  type HasCaptureStream = HTMLVideoElement & { captureStream(): MediaStream };
+  const stream = (video as HasCaptureStream).captureStream();
+  const track = stream.getVideoTracks()[0];
+  if (!track) throw new Error("replay captureStream returned no video tracks");
+  /* Free the object URL once the TRACK is torn down (its own "ended", fired by
+     track.stop()), not the <video> element's "ended" -- video.loop means
+     playback never reaches that event, so the URL would otherwise leak for as
+     long as the tab stays open. */
+  track.addEventListener("ended", () => URL.revokeObjectURL(url), { once: true });
   return track;
 }
 
