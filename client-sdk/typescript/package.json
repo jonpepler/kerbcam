@@ -1,6 +1,6 @@
 {
   "name": "@ksp-gonogo/kerbcast",
-  "version": "1.7.0",
+  "version": "1.8.0",
   "description": "TypeScript client for the kerbcast KSP camera-streaming sidecar. KerbcastClient wraps the WebRTC peer + control channel; wire-format types are typeshare-generated from the sidecar's Rust protocol module.",
   "license": "MIT",
   "author": "Jon Pepler",
