@@ -16,10 +16,11 @@
  * instead proves the real controller and real mock cooperate correctly.
  */
 
-import { KerbcastClient, utToRecordingTimeMs } from "@ksp-gonogo/kerbcast";
+import { ARM_TIMEOUT_MS, KerbcastClient, utToRecordingTimeMs } from "@ksp-gonogo/kerbcast";
 import type { GroupTrimmer } from "@ksp-gonogo/kerbcast";
 import { MockSidecar } from "@ksp-gonogo/kerbcast/testing";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { ConnectionManager } from "./connectionManager";
 
 function fakeVideoTrack(): MediaStreamTrack {
   return { kind: "video" } as MediaStreamTrack;
@@ -234,6 +235,123 @@ describe("force-full-resolution through the mock: grouped", () => {
     expect(trimCalls).toHaveLength(2);
     for (const call of trimCalls) {
       expect(call.startMs).toBe(utToRecordingTimeMs(handle.recordings[0].utSamples, 100));
+    }
+  });
+});
+
+/*
+ * Regression coverage for the production connect path: connectedClientWithTracks
+ * above calls discover() manually (a test-only convenience), but the real web
+ * page's ConnectionManager is what actually drives connect() in the browser.
+ * Before this fix, ConnectionManager never called discover(), so
+ * maxRenderSize stayed null for every feed and a force-full-resolution arm on
+ * a feed already at its render ceiling had no known target to check against;
+ * it fell back to the weaker "operator size increased" heuristic, which can
+ * never fire for a feed that never changes, so the single-recording
+ * arm-and-wait ran out the full ARM_TIMEOUT_MS before recording started,
+ * losing the first ~3s of the clip.
+ */
+describe("force-full-resolution through the real production connect flow (ConnectionManager)", () => {
+  it("arms promptly for a feed already at its render ceiling, because ConnectionManager wires discover() into connect()", async () => {
+    const sidecar = new MockSidecar();
+    sidecar.withSlots(["0", "1", "2", "3", "4", "5", "6", "7"]);
+    sidecar.onSubscribe((_flightId, mid) => sidecar.deliverTrack(mid, fakeVideoTrack()));
+    sidecar.addCamera({
+      flightId: 7,
+      renderWidth: 1280,
+      renderHeight: 720,
+      operatorWidth: 1280,
+      operatorHeight: 720,
+    });
+
+    vi.spyOn(globalThis, "fetch").mockImplementation((input: RequestInfo | URL) => {
+      const url =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : (input as Request).url;
+      if (url.endsWith("/cameras")) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ cameras: sidecar.discoveredCameras() }), { status: 200 }),
+        );
+      }
+      return Promise.reject(new Error(`unexpected fetch: ${url}`));
+    });
+
+    const client = new KerbcastClient(
+      { host: "h", port: 1, negotiate: (o) => sidecar.negotiate(o) },
+      sidecar.createTransport(),
+    );
+
+    const manager = new ConnectionManager(client);
+    manager.start();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    sidecar.open();
+    sidecar.setConnectionState("connected");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    await client.subscribe(7);
+
+    expect(client.camera(7).maxRenderSize).toEqual({ width: 1280, height: 720 });
+
+    const id = client.recording.startRecording(7, { forceFullResolution: true });
+    expect(
+      client.recording.getSnapshot().active.find((a) => a.recordingId === id)?.arming,
+    ).toBe(true);
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(
+      client.recording.getSnapshot().active.find((a) => a.recordingId === id)?.arming,
+    ).toBe(false);
+
+    await client.recording.stopRecording(id);
+    manager.stop();
+  });
+
+  it("regression guard: with maxRenderSize unknown (no discover()), the same already-at-ceiling feed stalls for the full ARM_TIMEOUT_MS", async () => {
+    vi.useFakeTimers();
+    try {
+      const sidecar = new MockSidecar();
+      sidecar.withSlots(["0", "1", "2", "3"]);
+      sidecar.onSubscribe((_flightId, mid) => sidecar.deliverTrack(mid, fakeVideoTrack()));
+      sidecar.addCamera({
+        flightId: 7,
+        renderWidth: 1280,
+        renderHeight: 720,
+        operatorWidth: 1280,
+        operatorHeight: 720,
+      });
+
+      const client = new KerbcastClient(
+        { host: "h", port: 1, negotiate: (o) => sidecar.negotiate(o) },
+        sidecar.createTransport(),
+      );
+      await client.connect([], { slots: 4 });
+      sidecar.open();
+      sidecar.setConnectionState("connected");
+      await client.subscribe(7);
+
+      expect(client.camera(7).maxRenderSize).toBeNull();
+
+      const id = client.recording.startRecording(7, { forceFullResolution: true });
+      expect(
+        client.recording.getSnapshot().active.find((a) => a.recordingId === id)?.arming,
+      ).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(ARM_TIMEOUT_MS - 100);
+      expect(
+        client.recording.getSnapshot().active.find((a) => a.recordingId === id)?.arming,
+      ).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(200);
+      expect(
+        client.recording.getSnapshot().active.find((a) => a.recordingId === id)?.arming,
+      ).toBe(false);
+
+      await client.recording.stopRecording(id);
+    } finally {
+      vi.useRealTimers();
     }
   });
 });

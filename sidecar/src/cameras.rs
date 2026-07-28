@@ -1775,6 +1775,23 @@ impl CameraRegistry {
         }
     }
 
+    /// A consumer stopped displaying ONE camera (explicit unsubscribe /
+    /// rebind-away): forget its force for that camera and reflush so the
+    /// ceiling relaxes if it was the last peer forcing it. Mirrors
+    /// `forget_display_size`. Idempotent; skips the reflush when nothing was
+    /// held.
+    pub async fn forget_forced(&self, flight_id: u32, peer_id: u32) {
+        let removed = match self.get(flight_id).await {
+            Some(cam) => cam.forget_forced(peer_id).await,
+            None => return,
+        };
+        if removed {
+            if let Err(e) = self.flush_effective_render_size(flight_id).await {
+                warn!(flight_id, error = %e, "force-full-res forget flush failed");
+            }
+        }
+    }
+
     /// Forget a peer's force across EVERY camera, reflushing the ones that
     /// held the key. Peer-scoped for the same reason as
     /// `forget_display_size_all`: a force can exist for a camera the peer
@@ -2396,6 +2413,49 @@ mod tests {
             cam.effective_render_size().await,
             Some((40, 40)),
             "released back to demand once every peer clears"
+        );
+    }
+
+    /// `registry.forget_forced(flight_id, peer_id)` mirrors
+    /// `registry.forget_display_size(flight_id, peer_id)`: the single-camera
+    /// clear used on an explicit Unsubscribe. Regression coverage for the
+    /// leak where `handle_unsubscribe` cleared the display-size report but
+    /// never the force pin, so a feed a peer had forced to the ring ceiling
+    /// stayed pinned there forever once that peer unsubscribed without a
+    /// full Disconnect (e.g. switching feeds mid-recording).
+    #[tokio::test]
+    async fn forget_forced_relaxes_the_ceiling_for_one_camera_on_unsubscribe() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shm = dir.path();
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 1024,
+            max_height: 1024,
+        };
+        for id in [7_301u32, 7_302u32] {
+            MmapFrameRing::create(&shm.join(format!("{id}.ring")), cfg).expect("create ring");
+        }
+        let registry = CameraRegistry::new(shm.to_path_buf());
+        registry.rescan().await;
+        let cam_a = registry.get(7_301).await.expect("cam a");
+        let cam_b = registry.get(7_302).await.expect("cam b");
+
+        cam_a.set_forced(1, true).await;
+        cam_b.set_forced(1, true).await;
+        assert_eq!(cam_a.effective_render_size().await, Some((1024, 1024)));
+        assert_eq!(cam_b.effective_render_size().await, Some((1024, 1024)));
+
+        registry.forget_forced(7_301, 1).await;
+
+        assert_eq!(
+            cam_a.effective_render_size().await,
+            None,
+            "unsubscribing from camera A must release peer 1's force on A"
+        );
+        assert_eq!(
+            cam_b.effective_render_size().await,
+            Some((1024, 1024)),
+            "camera B is untouched -- the clear is single-camera scoped, not peer-wide"
         );
     }
 

@@ -687,6 +687,13 @@ async fn handle_unsubscribe(
     // MAX relaxes and can't pin high. Also covers the rebind-away path (a slot
     // only rebinds after an unsubscribe).
     registry.forget_display_size(flight_id, peer_id).await;
+    // Same clear-on-departure for a force-full-resolution pin: an explicit
+    // Unsubscribe(X) must release this peer's force on X too, or a feed stays
+    // pinned to the ring ceiling forever once its forcer unsubscribes without
+    // a graceful Disconnect (e.g. switching feeds mid-recording). Mirrors the
+    // display-size clear above; the Disconnect/reaper paths already call
+    // forget_forced_all for the whole-peer-departure case.
+    registry.forget_forced(flight_id, peer_id).await;
 
     let (track, mid) = {
         let mut guard = slots.lock().await;
@@ -1477,6 +1484,58 @@ mod tests {
             freed,
             "pc.close() must release the sender's track Arc within ~2s — \
              this is the mechanism F4 relies on to free camera subscriptions"
+        );
+    }
+
+    // Regression coverage for the v1.8 force-full-resolution leak:
+    // `handle_unsubscribe` cleared a peer's reported display size on
+    // Unsubscribe but never its force-full-resolution pin, so a feed a peer
+    // had forced to the ring ceiling (e.g. a full-resolution recording)
+    // stayed pinned at the ceiling forever once that peer unsubscribed
+    // without a full graceful Disconnect (e.g. switching feeds mid-
+    // recording). No slot is bound for this flight_id here, exercising the
+    // early-out path in `handle_unsubscribe` -- the force-pin clear (like
+    // the display-size clear beside it) must happen unconditionally, before
+    // that binding check, since a report/force is never binding-gated.
+    #[tokio::test]
+    async fn handle_unsubscribe_releases_this_peers_force_pin() {
+        use crate::shared_mem::{MmapFrameRing, MmapRingConfig};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = MmapRingConfig {
+            slot_count: 4,
+            max_width: 1024,
+            max_height: 1024,
+        };
+        let ring_path = dir.path().join("9001.ring");
+        MmapFrameRing::create(&ring_path, cfg).expect("create ring");
+        let registry = Arc::new(CameraRegistry::new(dir.path().to_path_buf()));
+        registry.rescan().await;
+
+        let cam = registry.get(9001).await.expect("camera attached");
+        let peer_id = 42u32;
+        cam.set_forced(peer_id, true).await;
+        assert_eq!(
+            cam.effective_render_size().await,
+            Some((1024, 1024)),
+            "forced feed sizes to the ring ceiling"
+        );
+
+        let slots: Arc<Mutex<Vec<Slot>>> = Arc::new(Mutex::new(Vec::new()));
+        let pc = build_pc().await;
+        let dc = pc
+            .create_data_channel(CONTROL_CHANNEL_LABEL, None)
+            .await
+            .expect("data channel");
+
+        handle_unsubscribe(&registry, peer_id, &slots, &dc, 9001).await;
+
+        assert_eq!(
+            cam.effective_render_size().await,
+            None,
+            "Unsubscribe must release this peer's force-full-resolution pin, \
+             not just its display-size report -- otherwise the feed never \
+             relaxes off the ring ceiling"
         );
     }
 

@@ -88,9 +88,33 @@ export class ConnectionManager {
     if (this._stopped) return;
     this._setStatus({ kind: "connecting" });
     try {
+      await this._discover();
       await this._client.connect([], { slots: CONNECT_SLOTS });
     } catch {
       this._scheduleReconnect();
+    }
+  }
+
+  /**
+   * Best-effort camera discovery (`GET /cameras`) ahead of the peer connect,
+   * so `KerbcastCameraHandle.maxRenderSize` is populated for every feed
+   * before subscriptions start. Without this, a force-full-resolution arm
+   * on a feed already at its render ceiling has no known target to check
+   * against (see `RecordingController.watchResolutionReady`) and falls back
+   * to the weaker "operator size increased" heuristic, which never fires for
+   * a feed that was already at its ceiling -- burning the full
+   * `ARM_TIMEOUT_MS` before recording starts and losing the clip's opening
+   * seconds.
+   *
+   * Failure here must never block the actual connect: discovery is a
+   * nice-to-have (it only sharpens the arm-and-wait check), not a
+   * precondition for streaming.
+   */
+  private async _discover(): Promise<void> {
+    try {
+      await this._client.discover();
+    } catch {
+      // best-effort; connect() proceeds regardless.
     }
   }
 

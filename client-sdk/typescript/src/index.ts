@@ -35,6 +35,7 @@ export {
   commonUtWindow,
   utToRecordingTimeMs,
   DEFAULT_COVERAGE_TIMEOUT_MS,
+  ARM_TIMEOUT_MS,
   type ActiveRecordingInfo,
   type RecordingClient,
   type RecordingControllerOptions,
