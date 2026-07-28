@@ -1,8 +1,13 @@
 # Changelog
 
-## Unreleased (next minor)
+## 1.8.0 - 2026-07-28
 
-Client-side camera recording (pure SDK; no sidecar/plugin/protocol change).
+Client-side camera recording. The capture itself is pure SDK: the recorder taps
+a track the browser has already received, and the sidecar never learns a
+recording happened. Full-resolution recording is the exception, and it does
+reach the wire: it added the `SetForceFullResolution` control message to the
+protocol, plus the matching force-pin handling in the sidecar's camera
+registry.
 
 ### Added
 

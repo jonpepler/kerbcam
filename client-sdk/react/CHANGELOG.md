@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (next minor)
+## 1.8.0 - 2026-07-28
 
 ### Added
 
