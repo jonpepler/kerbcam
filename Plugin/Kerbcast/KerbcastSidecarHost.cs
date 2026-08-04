@@ -60,6 +60,20 @@ namespace Kerbcast
         private volatile bool _expectedExit;
         private volatile int _lastExitCode;
 
+        /* Cheap process-alive probe for the public facade. HasExited throws
+           once the handle is detached, so a throw reports dead rather than
+           propagating into the caller's frame. */
+        public bool SidecarRunning
+        {
+            get
+            {
+                var p = _sidecar;
+                if (p == null) return false;
+                try { return !p.HasExited; }
+                catch (Exception) { return false; }
+            }
+        }
+
         /// <summary>
         /// Create the host on first call, then notify it of a flight-scene
         /// entry. Called from every KerbcastCore.Awake; only the first call

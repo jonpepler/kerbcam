@@ -35,6 +35,11 @@ namespace Kerbcast
     {
         public static bool IsActive => KerbcastCore.Instance != null;
 
+        /* Whether the video sidecar process is currently alive. False out of
+           flight (no host yet) and false once the process dies, which is the
+           state where every feed goes black while the mod still looks healthy. */
+        public static bool SidecarAlive => KerbcastSidecarHost.Instance?.SidecarRunning ?? false;
+
         public static IReadOnlyList<KerbcastCameraView> CamerasFor(global::Vessel vessel)
         {
             var result = new List<KerbcastCameraView>();
