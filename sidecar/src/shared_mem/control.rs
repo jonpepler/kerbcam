@@ -49,6 +49,10 @@
 //!                                applies track_mode only on a change, so the
 //!                                every-flush stale value can't revert a kOS-set
 //!                                mode. Append -> no version bump.)
+//!   +64  4   f32 capture_fps    (requested capture rate. Present-bit CLEAR =
+//!                                capture at the primary rate, which is what a
+//!                                pre-hum sidecar writes. A low value is a
+//!                                background hum. Append -> no version bump.)
 //! ```
 //!
 //! NOTE: this field is an APPEND with its own `fields_present` bit, NOT a layout
@@ -113,6 +117,13 @@ const B_TRACK_MODE: usize = 56;
 // track_seq changes (edge-trigger), so the every-flush stale track_mode can't
 // revert a kOS-set mode. Appended within the reserved body -> no version bump.
 const B_TRACK_SEQ: usize = 60;
+// capture_fps (+64): the rate the plugin should capture this camera at, in
+// frames per second. Present-bit gated: clear = capture at the primary rate,
+// which is what a pre-hum sidecar writes and what the plugin already did. A low
+// value is a background "hum" — subscribed, but paced far below primary because
+// nothing is displaying it at size. Appended within the reserved body, so the
+// golden fixture stays byte-identical and old/new builds interoperate.
+const B_CAPTURE_FPS: usize = 64;
 
 // `fields_present` bits — one per Option/Vec field that can be "unset".
 pub const FP_LAYERS: u32 = 1 << 0;
@@ -126,6 +137,7 @@ pub const FP_PAN_PITCH_RATE: u32 = 1 << 7;
 pub const FP_ZOOM_RATE: u32 = 1 << 8;
 pub const FP_VIEWER_LEVEL: u32 = 1 << 9;
 pub const FP_TRACK_MODE: u32 = 1 << 10;
+pub const FP_CAPTURE_FPS: u32 = 1 << 11;
 
 /// Auto-track mode → the u32 the plugin decodes (0=none, 1=active-vessel,
 /// 2=target). Keep in lockstep with ControlBlock.cs's SetTrackMode mapping.
@@ -244,6 +256,9 @@ impl ControlBlock {
         // (the sidecar always writes full state, so the plugin reads absence as
         // "stop tracking", not "leave untouched"). Keeps the golden fixture
         // byte-identical while none is the default.
+        if s.capture_fps.is_some() {
+            present |= FP_CAPTURE_FPS;
+        }
         if s.track_mode != TrackMode::None {
             present |= FP_TRACK_MODE;
         }
@@ -270,6 +285,7 @@ impl ControlBlock {
         self.put_u32(B_VIEWER_LEVEL, s.viewer_level.unwrap_or(0));
         self.put_u32(B_TRACK_MODE, track_mode_to_u32(s.track_mode));
         self.put_u32(B_TRACK_SEQ, s.track_seq);
+        self.put_f32(B_CAPTURE_FPS, s.capture_fps.unwrap_or(0.0));
     }
 }
 
@@ -298,6 +314,9 @@ pub struct ControlSnapshot {
     /// Monotonic counter the sidecar bumps on any authoritative track_mode
     /// change; the plugin applies track_mode only on a change (edge-trigger).
     pub track_seq: u32,
+    /// Requested capture rate in fps. `None` when the present bit is clear =
+    /// capture at the primary rate.
+    pub capture_fps: Option<f32>,
 }
 
 fn rd_u32(buf: &[u8], at: usize) -> u32 {
@@ -311,7 +330,7 @@ fn rd_f32(buf: &[u8], at: usize) -> f32 {
 /// magic+version. Returns `None` if the bytes don't carry our layout — the
 /// reader's "not ready / wrong build" gate.
 pub fn decode(buf: &[u8]) -> Option<ControlSnapshot> {
-    if buf.len() < CONTROL_HEADER_SIZE + B_TRACK_SEQ + 4 {
+    if buf.len() < CONTROL_HEADER_SIZE + B_CAPTURE_FPS + 4 {
         return None;
     }
     if u64::from_le_bytes(buf[H_MAGIC..H_MAGIC + 8].try_into().unwrap()) != CONTROL_MAGIC {
@@ -353,6 +372,7 @@ pub fn decode(buf: &[u8]) -> Option<ControlSnapshot> {
         viewer_level: opt_u32(FP_VIEWER_LEVEL, B_VIEWER_LEVEL),
         track_mode: opt_u32(FP_TRACK_MODE, B_TRACK_MODE),
         track_seq: rd_u32(buf, b + B_TRACK_SEQ),
+        capture_fps: opt_f32(FP_CAPTURE_FPS, B_CAPTURE_FPS),
     })
 }
 
@@ -384,6 +404,9 @@ mod tests {
             // Left 0 so +60 stays zero and the golden fixture stays
             // byte-identical (track_seq has its own dedicated test below).
             track_seq: 0,
+            // Left None for the same reason: bit clear, +64 zero, fixture
+            // unchanged. Its own round-trip test covers the set case.
+            capture_fps: None,
         }
     }
 
@@ -472,6 +495,33 @@ mod tests {
             ..fixture_state()
         };
         assert_eq!(decode(&write_to_vec(&active)).unwrap().track_mode, Some(1));
+    }
+
+    #[test]
+    fn capture_fps_roundtrips_and_defaults_absent() {
+        // Absent by default: bit clear, +64 zero, golden fixture unchanged.
+        let snap = decode(&write_to_vec(&fixture_state())).expect("decodes");
+        assert_eq!(snap.capture_fps, None);
+        assert_eq!(snap.fields_present & FP_CAPTURE_FPS, 0);
+
+        // A hum rate round-trips.
+        let humming = ControlState {
+            capture_fps: Some(1.5),
+            ..fixture_state()
+        };
+        let snap = decode(&write_to_vec(&humming)).expect("decodes");
+        assert_eq!(snap.capture_fps, Some(1.5));
+        assert_ne!(snap.fields_present & FP_CAPTURE_FPS, 0);
+
+        // Present-and-zero is distinct from absent: an explicit "capture
+        // nothing" must not read back as "capture at the primary rate".
+        let stopped = ControlState {
+            capture_fps: Some(0.0),
+            ..fixture_state()
+        };
+        let snap = decode(&write_to_vec(&stopped)).expect("decodes");
+        assert_eq!(snap.capture_fps, Some(0.0));
+        assert_ne!(snap.fields_present & FP_CAPTURE_FPS, 0);
     }
 
     #[test]

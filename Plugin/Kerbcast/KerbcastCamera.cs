@@ -213,6 +213,18 @@ namespace Kerbcast
         /// is budgeted over the subscribed set only — idle cameras cost nothing
         /// and must not consume capture permits.</summary>
         public bool Subscribed => _subscribed;
+
+        /* Background "hum" pacing: a subscribed camera nothing is displaying at
+           size still ticks over at a reduced rate, so switching to it promotes
+           an already-flowing stream. Decision logic lives in CapturePacing so
+           it is unit-testable without Unity. */
+        private CapturePacing _pacing;
+        public float EffectiveCaptureFps(float primaryFps, float backgroundCeilingFps)
+            => _pacing.Effective(primaryFps, backgroundCeilingFps);
+        public bool CaptureDue(float now, float effectiveFps, float primaryFps)
+            => _pacing.Due(now, effectiveFps, primaryFps);
+        public void MarkCaptureGranted(float now) => _pacing.MarkGranted(now);
+
         private bool _disposed;
         private bool _firstRender = true;
         private bool _firstPixelCheck = true;
@@ -1301,6 +1313,9 @@ namespace Kerbcast
                     _subscribed = snap.Subscribed;
                     if (_subscribed)
                     {
+                        // Due immediately on resubscribe: a stale interval from
+                        // before the gap must not hold the first frame back.
+                        _pacing.Reset();
                         // Snap interpolation to target on peer reconnect so the
                         // peer sees the current commanded position immediately
                         // instead of a phantom pan-back from the last rest position.
@@ -1323,6 +1338,11 @@ namespace Kerbcast
                     Debug.Log($"[Kerbcast] cam={FlightId} subscribed → {_subscribed}");
                     ApplyLayers();
                 }
+
+                /* Requested capture rate. Absent = capture at the primary rate,
+                   which is what a pre-hum sidecar writes, so an old sidecar and
+                   a new plugin behave exactly as before. */
+                _pacing.RequestedFps = snap.CaptureFps;
 
                 if (snap.HasLayers)
                 {

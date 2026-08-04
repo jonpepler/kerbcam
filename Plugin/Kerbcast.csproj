@@ -117,6 +117,7 @@
   <ItemGroup>
     <Compile Remove="AdaptiveQualityController.Tests/**/*.cs" />
     <Compile Remove="ControlBlock.Tests/**/*.cs" />
+    <Compile Remove="CapturePacing.Tests/**/*.cs" />
     <Compile Remove="HullcamContract.Tests/**/*.cs" />
     <Compile Remove="ShedController.Tests/**/*.cs" />
     <Compile Remove="StaggerBudgetController.Tests/**/*.cs" />

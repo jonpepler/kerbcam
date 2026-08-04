@@ -59,6 +59,23 @@ pub fn select_backend(choice: EncoderChoice) -> Box<dyn EncoderBackend> {
 #[derive(Debug, Clone)]
 pub struct Nal(pub Vec<u8>);
 
+impl Nal {
+    /// Whether this NAL is an IDR slice (`nal_unit_type == 5`) — the unit a
+    /// decoder can start cleanly from. Used to tell when a forced keyframe has
+    /// actually gone out, rather than assuming it did because one was asked for.
+    pub fn is_keyframe(&self) -> bool {
+        let b = &self.0;
+        let hdr = if b.len() > 4 && b[..4] == [0, 0, 0, 1] {
+            b[4]
+        } else if b.len() > 3 && b[..3] == [0, 0, 1] {
+            b[3]
+        } else {
+            return false;
+        };
+        hdr & 0x1F == 5
+    }
+}
+
 /// One frame's worth of raw input pixels. RGBA8, top-down, tightly packed.
 /// `width * height * 4 == data.len()` is a documented invariant; encoders
 /// must validate on init.

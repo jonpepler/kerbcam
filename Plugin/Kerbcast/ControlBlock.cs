@@ -92,6 +92,12 @@ namespace Kerbcast
         /// moves (edge-trigger), so a stale flush can't revert a kOS-set mode.
         /// Always read (fixed field), like PanSeq/FovSeq.</summary>
         public uint TrackSeq;
+        /// <summary>Requested capture rate in frames per second. Null = capture
+        /// at the primary rate (today's behaviour, and what a pre-hum sidecar
+        /// leaves clear). A low value is a background "hum": the camera stays
+        /// subscribed but is paced far below the primary rate because nothing
+        /// is displaying it at size.</summary>
+        public float? CaptureFps;
         /// <summary>The seqlock value this snapshot was read at (even).</summary>
         public long Seq;
     }
@@ -129,6 +135,10 @@ namespace Kerbcast
         // control-block track_mode only when it moves (edge-trigger), so a stale
         // flush can't revert a kOS-set mode. Append -> no LayoutVersion bump.
         private const int BTrackSeq = HeaderSize + 60;
+        // Another APPEND, same forward-compatible rules as track_mode above: an
+        // old reader ignores the bit and never touches +64, so the golden
+        // fixture stays byte-identical and a pre-hum sidecar interoperates.
+        private const int BCaptureFps = HeaderSize + 64;
 
         // fields_present bits — one per Option/Vec field.
         public const uint FpLayers = 1u << 0;
@@ -142,6 +152,7 @@ namespace Kerbcast
         public const uint FpZoomRate = 1u << 8;
         public const uint FpViewerLevel = 1u << 9;
         public const uint FpTrackMode = 1u << 10;
+        public const uint FpCaptureFps = 1u << 11;
 
         private readonly MemoryMappedFile _mmf;
         private readonly MemoryMappedViewAccessor _view;
@@ -251,6 +262,7 @@ namespace Kerbcast
                 FovSeq = _view.ReadUInt32(BFovSeq),
                 ViewerLevel = (present & FpViewerLevel) != 0 ? _view.ReadUInt32(BViewerLevel) : (uint?)null,
                 TrackMode = (present & FpTrackMode) != 0 ? _view.ReadUInt32(BTrackMode) : (uint?)null,
+                CaptureFps = (present & FpCaptureFps) != 0 ? _view.ReadSingle(BCaptureFps) : (float?)null,
                 TrackSeq = _view.ReadUInt32(BTrackSeq),
                 Seq = seq,
             };
