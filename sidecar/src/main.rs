@@ -19,7 +19,7 @@ use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use webrtc::media::Sample;
 
 use kerbcast_sidecar::cameras::{CameraRegistry, CameraState};
@@ -442,6 +442,7 @@ async fn consume_loop(
                 continue;
             }
             if cam.subscribers.load(Ordering::Acquire) == 0 {
+                debug!(flight_id = cam.flight_id, "skipped: no subscribers");
                 continue;
             }
             any_active = true;
@@ -642,7 +643,10 @@ async fn encode_and_fan_out(
 
     let frame = match cam.ring.latest() {
         Ok(Some(f)) => f,
-        Ok(None) => return,
+        Ok(None) => {
+            debug!(flight_id = cam.flight_id, "ring had no frame this tick");
+            return;
+        }
         Err(e) => {
             warn!(flight_id = cam.flight_id, error = %e, "ring read failed");
             return;
@@ -651,8 +655,34 @@ async fn encode_and_fan_out(
 
     let last = cam.last_sequence.load(Ordering::Acquire);
     if frame.sequence <= last {
+        /* Stale-or-equal frame. Equal is the normal idle case (we already
+           sent it). BEHIND is not normal and is unrecoverable on its own: a
+           recreated ring restarts its sequence low while last_sequence keeps
+           the old high value, so every future frame fails this check and the
+           camera goes permanently silent with no error anywhere. Warn (not
+           debug) on that case so it is visible without raising the log level. */
+        if frame.sequence < last {
+            warn!(
+                flight_id = cam.flight_id,
+                ring_sequence = frame.sequence,
+                last_sequence = last,
+                "ring sequence went BACKWARDS — camera will stay silent until this resets"
+            );
+        } else {
+            debug!(
+                flight_id = cam.flight_id,
+                sequence = frame.sequence,
+                "no new frame this tick (sequence unchanged)"
+            );
+        }
         return;
     }
+    debug!(
+        flight_id = cam.flight_id,
+        sequence = frame.sequence,
+        advanced_by = frame.sequence - last,
+        "new frame accepted for encode"
+    );
     cam.last_sequence.store(frame.sequence, Ordering::Release);
 
     // Apply SetDegrade. Two cheap levers:
@@ -897,15 +927,37 @@ async fn encode_and_fan_out(
     let prev = std::mem::take(&mut *tracks);
     let mut alive = Vec::with_capacity(prev.len());
     let mut pruned = 0usize;
+    let mut sent = 0usize;
     for weak in prev {
         if let Some(track) = weak.upgrade() {
             if let Err(e) = track.write_sample(&sample).await {
                 warn!(flight_id = cam.flight_id, error = %e, "write_sample failed");
+            } else {
+                sent += 1;
             }
             alive.push(weak);
         } else {
             pruned += 1;
         }
+    }
+    /* Subscribers>0 but zero live tracks means the subscriber count and the
+       weak-ref list have diverged: we believe someone is watching, so we keep
+       encoding, but there is nobody to send to. Silent black feed. */
+    if sent == 0 {
+        warn!(
+            flight_id = cam.flight_id,
+            pruned,
+            subscribers = cam.subscribers.load(Ordering::Acquire),
+            "encoded a frame but sent it to NOBODY (no live tracks)"
+        );
+    } else {
+        debug!(
+            flight_id = cam.flight_id,
+            sent,
+            pruned,
+            bytes = sample.data.len(),
+            "sample fanned out"
+        );
     }
     *tracks = alive;
     drop(tracks);
