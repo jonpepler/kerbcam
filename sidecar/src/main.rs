@@ -656,11 +656,11 @@ async fn encode_and_fan_out(
     let last = cam.last_sequence.load(Ordering::Acquire);
     if frame.sequence <= last {
         /* Stale-or-equal frame. Equal is the normal idle case (we already
-           sent it). BEHIND is not normal and is unrecoverable on its own: a
-           recreated ring restarts its sequence low while last_sequence keeps
-           the old high value, so every future frame fails this check and the
-           camera goes permanently silent with no error anywhere. Warn (not
-           debug) on that case so it is visible without raising the log level. */
+        sent it). BEHIND is not normal and is unrecoverable on its own: a
+        recreated ring restarts its sequence low while last_sequence keeps
+        the old high value, so every future frame fails this check and the
+        camera goes permanently silent with no error anywhere. Warn (not
+        debug) on that case so it is visible without raising the log level. */
         if frame.sequence < last {
             warn!(
                 flight_id = cam.flight_id,
@@ -941,8 +941,8 @@ async fn encode_and_fan_out(
         }
     }
     /* Subscribers>0 but zero live tracks means the subscriber count and the
-       weak-ref list have diverged: we believe someone is watching, so we keep
-       encoding, but there is nobody to send to. Silent black feed. */
+    weak-ref list have diverged: we believe someone is watching, so we keep
+    encoding, but there is nobody to send to. Silent black feed. */
     if sent == 0 {
         warn!(
             flight_id = cam.flight_id,
