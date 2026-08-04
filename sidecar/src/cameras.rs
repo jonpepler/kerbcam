@@ -25,8 +25,8 @@ use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSampl
 
 use crate::encoder::{EncoderBackend, SessionHealth};
 use crate::protocol::{
-    CameraKind, CameraLifecycle, CameraState as ProtocolCameraState, CrewLocation, Layer,
-    QualityPreset, SettingsStatePayload, TrackMode,
+    CameraKind, CameraLifecycle, CameraState as ProtocolCameraState, CaptureState, CrewLocation,
+    Layer, QualityPreset, SettingsStatePayload, TrackMode,
 };
 use crate::shared_mem::{ControlBlock, MmapFrameRing};
 
@@ -90,6 +90,13 @@ struct GlobalStatusFile {
     /// older plugin writes; defaults to `false` so existing data is safe.
     #[serde(default)]
     throttle_main_screen: bool,
+    /// Background-hum ceiling currently in force, in fps, after the plugin's
+    /// hum shed rung. The plugin owns this number; the sidecar only knows
+    /// which cameras nobody is displaying. Absent in older plugin writes and
+    /// 0 when the operator left the hum off, both of which mean "no hum",
+    /// so every camera keeps being asked for the primary rate as before.
+    #[serde(default)]
+    background_capture_fps: f32,
     /// Mission-time capture clock (see `SettingsStatePayload`). All three
     /// absent in older plugin writes; `None` => no clock, surfaced as
     /// "unknown" to consumers.
@@ -153,6 +160,10 @@ pub struct StatusDelta {
     /// clock) changed since the last poll. The consume loop broadcasts one
     /// `SettingsState` carrying the full current payload when this is `Some`.
     pub settings: Option<SettingsStatePayload>,
+    /// The plugin's background-hum ceiling moved (operator change, or the hum
+    /// rung shedding / restoring under load). Every humming camera's requested
+    /// rate derives from it, so the consume loop reflushes control blocks.
+    pub hum_ceiling_changed: bool,
 }
 
 /// Membership churn from one `rescan` pass over the shm dir. With the
@@ -258,6 +269,13 @@ pub struct ControlState {
     /// kOS-set mode. Same pattern as `pan_seq`/`fov_seq`.
     #[serde(default)]
     pub track_seq: u32,
+    /// Requested capture rate in fps. `None` = capture at the primary rate,
+    /// which is the pre-hum behaviour and stays the default. A low value is a
+    /// background hum: the camera is subscribed but nothing is displaying it at
+    /// size, so it is paced far below primary to keep a recent frame available
+    /// without paying full capture cost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_fps: Option<f32>,
 }
 
 /// serde skip helper: keep the debug JSON clean for the common not-tracking case.
@@ -505,6 +523,11 @@ pub struct CameraState {
     pub last_sequence: AtomicU64,
     /// Count of peer-tracks currently subscribed. Encoder runs only when > 0.
     pub subscribers: AtomicUsize,
+    /// Promoted out of the hum but not yet renderable — set when display demand
+    /// appears, cleared when a keyframe is emitted.
+    pub ramping: AtomicBool,
+    /// Pending forced-IDR request, consumed by the encode path.
+    pub keyframe_wanted: AtomicBool,
     /// One `TrackLocalStaticSample` per subscribed peer-track. Weak refs so
     /// dropped peers get GC'd from this list naturally — no manual unsub
     /// bookkeeping per peer needed.
@@ -568,6 +591,51 @@ impl CameraState {
             self.subscribers.fetch_sub(removed, Ordering::AcqRel);
         }
         self.subscribers.load(Ordering::Acquire)
+    }
+
+    /// How hard this camera is currently being captured, as published to
+    /// consumers. With background capture off (the default) this is the binary
+    /// it has always been: subscribed cameras are `Full`, the rest `Off`.
+    ///
+    /// `humming` is passed in rather than recomputed because it needs the
+    /// plugin-published ceiling, which lives on the registry, and because the
+    /// caller is already holding the answer.
+    pub fn capture_state_with(&self, humming: bool) -> CaptureState {
+        if self.subscribers.load(Ordering::Acquire) == 0 {
+            return CaptureState::Off;
+        }
+        if humming {
+            return CaptureState::Hum;
+        }
+        // Displayed, but the promotion hasn't produced a keyframe yet: the
+        // stream is live-but-not-yet-renderable, which is a different thing to
+        // tell a consumer than "full".
+        if self.ramping.load(Ordering::Acquire) {
+            return CaptureState::Ramping;
+        }
+        CaptureState::Full
+    }
+
+    /// Mark this camera as promoted out of the hum: it is being displayed
+    /// again, but nothing renderable has arrived yet. Cleared by the encode
+    /// path once a keyframe is emitted.
+    pub fn begin_ramp(&self) {
+        self.ramping.store(true, Ordering::Release);
+        self.keyframe_wanted.store(true, Ordering::Release);
+    }
+
+    /// Whether the encoder should force an IDR on its next encode, consuming
+    /// the request. Promotion sets it: a hum stream's periodic IDR is counted
+    /// in ENCODED FRAMES (`fps * 2`), so at 1fps the next natural keyframe can
+    /// be ~60s away and a promoted camera would sit unrenderable until then.
+    pub fn take_keyframe_request(&self) -> bool {
+        self.keyframe_wanted.swap(false, Ordering::AcqRel)
+    }
+
+    /// The promotion completed: a keyframe went out, so the feed is renderable
+    /// at full rate.
+    pub fn finish_ramp(&self) {
+        self.ramping.store(false, Ordering::Release);
     }
 
     /// Record a REMB bandwidth estimate from a subscriber. Identified
@@ -694,6 +762,31 @@ impl CameraState {
         self.forced_full_res.lock().await.remove(&peer_id)
     }
 
+    /// Whether anyone is actually displaying this camera at size right now.
+    /// `record_display_size` already drops sub-2px reports as "no demand", so a
+    /// non-empty map means genuinely on screen somewhere. A forced feed (e.g. a
+    /// full-resolution recording) counts as displayed even with no visible tile.
+    ///
+    /// This is the hum's discriminator: subscribed-and-displayed runs at the
+    /// primary rate, subscribed-but-undisplayed hums.
+    pub async fn has_display_demand(&self) -> bool {
+        if !self.forced_full_res.lock().await.is_empty() {
+            return true;
+        }
+        !self.display_sizes.lock().await.is_empty()
+    }
+
+    /// Capture rate to ask the plugin for, given the hum ceiling the plugin
+    /// published. `None` = the primary rate, which is both the displayed case
+    /// and the hum-disabled case — so with the hum off this is always `None`
+    /// and the plugin behaves exactly as it always has.
+    pub async fn requested_capture_fps(&self, hum_ceiling_fps: f32) -> Option<f32> {
+        if hum_ceiling_fps <= 0.0 || self.has_display_demand().await {
+            return None;
+        }
+        Some(hum_ceiling_fps)
+    }
+
     /// Effective render size = min(demand, manual cap), clamped to the ring's
     /// max dims and made even (H.264 chroma). Demand is normally the auto MAX-
     /// across-consumers display size; while ANY peer forces this camera (see
@@ -743,6 +836,16 @@ pub struct CameraRegistry {
     shm_dir: PathBuf,
     pub cameras: RwLock<HashMap<u32, Arc<CameraState>>>,
     last_status: Mutex<Option<GlobalStatusFile>>,
+    /// Per-consumer background-capture ("hum") requests, keyed by `peer_id`.
+    /// MAX-aggregated: the hum runs at the highest rate anyone asked for.
+    ///
+    /// Global rather than per-camera because it is a statement about how much
+    /// background cost to spend, not about one camera. Entries MUST be dropped
+    /// on disconnect and on peer reap — the identical per-peer-max shape leaked
+    /// in v1.6.3, where a departed peer's degrade stayed latched forever and
+    /// only a KSP restart cleared it, because the forget path ran after the
+    /// bindings it iterated had already been taken.
+    hum_requests: Mutex<std::collections::HashMap<u32, f32>>,
     /// Last-seen value of the `global.inflight` file, cached so the consume
     /// loop broadcasts `scene-state-changed` only when the flag flips.
     last_in_flight: Mutex<Option<bool>>,
@@ -883,6 +986,7 @@ impl CameraRegistry {
             shm_dir,
             cameras: RwLock::new(HashMap::new()),
             last_status: Mutex::new(None),
+            hum_requests: Mutex::new(std::collections::HashMap::new()),
             last_in_flight: Mutex::new(None),
             status_log: Mutex::new(std::collections::VecDeque::new()),
             epoch: Instant::now(),
@@ -1184,6 +1288,8 @@ impl CameraRegistry {
                             last_encoded_at: Mutex::new(None),
                             last_sequence: AtomicU64::new(0),
                             subscribers: AtomicUsize::new(0),
+                            ramping: AtomicBool::new(false),
+                            keyframe_wanted: AtomicBool::new(false),
                             tracks: RwLock::new(Vec::new()),
                             display_sizes: Mutex::new(std::collections::HashMap::new()),
                             manual_render_cap: Mutex::new(None),
@@ -1331,6 +1437,19 @@ impl CameraRegistry {
             delta.adaptive_shed = Some((parsed.shed_level, parsed.ksp_fps));
         }
 
+        /* The hum ceiling moves when the plugin sheds or restores the
+        background rung, and every humming camera's requested rate is derived
+        from it — so a move has to be pushed back down to the control blocks.
+        Reported rather than flushed here because `cameras` is read-locked;
+        the consume loop reflushes once the borrow ends. */
+        if last
+            .as_ref()
+            .map(|s| s.background_capture_fps != parsed.background_capture_fps)
+            .unwrap_or(parsed.background_capture_fps > 0.0)
+        {
+            delta.hum_ceiling_changed = true;
+        }
+
         /*
          * Global settings are broadcast as one SettingsState whenever any of
          * them moves (or on first poll, when `last` is None). The mission-time
@@ -1401,12 +1520,16 @@ impl CameraRegistry {
             let Some(cam) = cameras.get(&cam_status.flight_id) else {
                 continue;
             };
-            let viewer_quality = cam
-                .control
-                .lock()
-                .await
-                .viewer_level
-                .and_then(QualityPreset::from_viewer_level);
+            let (viewer_quality, humming) = {
+                let ctrl = cam.control.lock().await;
+                (
+                    ctrl.viewer_level.and_then(QualityPreset::from_viewer_level),
+                    // "Humming" is simply "we asked this camera for a reduced
+                    // rate" — the same fact the plugin was told, so the state we
+                    // publish can't drift from the state we commanded.
+                    ctrl.capture_fps.is_some(),
+                )
+            };
             delta.changed_cameras.push(ProtocolCameraState {
                 flight_id: cam_status.flight_id,
                 lifecycle: if cam.destroyed.load(Ordering::Acquire) {
@@ -1416,6 +1539,7 @@ impl CameraRegistry {
                 },
                 kind: cam.kind,
                 kerbal_persistent_id: cam.kerbal_persistent_id,
+                capture_state: cam.capture_state_with(humming),
                 crew_location: cam.crew_location(),
                 track_mode: cam.track_mode(),
                 part_name: cam.part_name.clone(),
@@ -1691,6 +1815,80 @@ impl CameraRegistry {
 
     /// Recompute a camera's effective render size (auto MAX-across-consumers ∩
     /// manual cap) and flush it into `ControlState.width/height` → the plugin.
+    /// Background-hum CEILING last published by the plugin, in fps. 0 when the
+    /// operator forbade it, when the plugin has shed it under load, or when
+    /// talking to a plugin too old to report it.
+    pub async fn hum_ceiling_fps(&self) -> f32 {
+        self.last_status
+            .lock()
+            .await
+            .as_ref()
+            .map(|s| s.background_capture_fps)
+            .unwrap_or(0.0)
+    }
+
+    /// Record a consumer's background-capture request. A rate of 0 (or less)
+    /// withdraws it. Returns whether the aggregate changed, so callers skip a
+    /// redundant reflush.
+    pub async fn set_hum_request(&self, peer_id: u32, fps: f32) -> bool {
+        let before = self.requested_hum_fps().await;
+        {
+            let mut reqs = self.hum_requests.lock().await;
+            if fps > 0.0 && fps.is_finite() {
+                reqs.insert(peer_id, fps);
+            } else {
+                reqs.remove(&peer_id);
+            }
+        }
+        self.requested_hum_fps().await != before
+    }
+
+    /// Drop a consumer's request on unsubscribe / disconnect / peer reap.
+    /// Returns whether an entry was actually removed. Idempotent.
+    ///
+    /// Not optional: leaving an entry behind pins the hum on for the rest of
+    /// the session with nobody watching, which is the v1.6.3 degrade leak
+    /// reproduced exactly.
+    pub async fn forget_hum_request(&self, peer_id: u32) -> bool {
+        self.hum_requests.lock().await.remove(&peer_id).is_some()
+    }
+
+    /// Highest background rate any connected consumer is asking for. 0 when
+    /// nobody asked — the stock case, which costs nothing.
+    pub async fn requested_hum_fps(&self) -> f32 {
+        self.hum_requests
+            .lock()
+            .await
+            .values()
+            .copied()
+            .fold(0.0f32, f32::max)
+    }
+
+    /// Background rate actually in force: what consumers asked for, bounded by
+    /// what the plugin permits. Both terms must be non-zero — a request with no
+    /// operator headroom, or headroom nobody asked for, means no hum.
+    pub async fn effective_hum_fps(&self) -> f32 {
+        let requested = self.requested_hum_fps().await;
+        if requested <= 0.0 {
+            return 0.0;
+        }
+        requested.min(self.hum_ceiling_fps().await)
+    }
+
+    /// Push a recomputed capture rate to every camera. Needed whenever the
+    /// AGGREGATE moves rather than one camera's demand: a consumer changing or
+    /// withdrawing its hum request, a consumer disconnecting, or the plugin
+    /// shedding its ceiling. Reuses the render-size flush because that path
+    /// already recomputes and writes the whole control block.
+    pub async fn reflush_all_capture_rates(&self) {
+        let ids: Vec<u32> = self.cameras.read().await.keys().copied().collect();
+        for flight_id in ids {
+            if let Err(e) = self.flush_effective_render_size(flight_id).await {
+                tracing::warn!(flight_id, error = %e, "capture-rate reflush failed");
+            }
+        }
+    }
+
     /// Called after any display-size report, forget, or manual-cap change. The
     /// plugin's adaptive-shed min() still rides underneath on the game side.
     pub async fn flush_effective_render_size(&self, flight_id: u32) -> std::io::Result<()> {
@@ -1698,6 +1896,24 @@ impl CameraRegistry {
             return Ok(()); // camera gone this tick — nothing to flush
         };
         let eff = cam.effective_render_size().await;
+        /* Demand drives the capture RATE as well as the size: a subscribed
+        camera nobody is displaying hums instead of running at full rate.
+        Recomputed here because this is exactly the path every display-size
+        change already flows through. */
+        let fps = cam
+            .requested_capture_fps(self.effective_hum_fps().await)
+            .await;
+        /* Promotion: this camera was humming and is now being displayed. Force
+        an IDR, because a hum stream's periodic keyframe is counted in encoded
+        frames (fps * 2), so at 1fps the next natural one can be ~60 seconds
+        away — the feed would stay unrenderable long past the point the
+        operator expects it. */
+        {
+            let was_humming = cam.control.lock().await.capture_fps.is_some();
+            if was_humming && fps.is_none() {
+                cam.begin_ramp();
+            }
+        }
         let snapshot = {
             let mut ctrl = cam.control.lock().await;
             let (w, h) = match eff {
@@ -1706,6 +1922,7 @@ impl CameraRegistry {
             };
             ctrl.width = w;
             ctrl.height = h;
+            ctrl.capture_fps = fps;
             ctrl.clone()
         };
         self.flush_control(flight_id, &snapshot).await?;
@@ -1878,6 +2095,7 @@ impl CameraRegistry {
             .unwrap_or_else(|| ctrl.pan_pitch.unwrap_or(0.0));
 
         let viewer_quality = ctrl.viewer_level.and_then(QualityPreset::from_viewer_level);
+        let humming = ctrl.capture_fps.is_some();
         let quality_limited_by =
             quality_limited_reason(operator_width, render_width, viewer_quality);
 
@@ -1890,6 +2108,7 @@ impl CameraRegistry {
             },
             kind: cam.kind,
             kerbal_persistent_id: cam.kerbal_persistent_id,
+            capture_state: cam.capture_state_with(humming),
             crew_location: cam.crew_location(),
             track_mode: cam.track_mode(),
             part_name: cam.part_name.clone(),
@@ -2340,6 +2559,188 @@ mod tests {
         assert_eq!(cam.effective_render_size().await, Some((512, 512)));
         cam.record_display_size(1, 0, 0).await;
         assert_eq!(cam.effective_render_size().await, None);
+    }
+
+    /// With the hum disabled (ceiling 0 — the default, and what an older plugin
+    /// reports) NO camera is ever asked for a reduced rate, displayed or not.
+    /// This is the "default changes nothing" guarantee.
+    #[tokio::test]
+    async fn hum_disabled_never_requests_a_reduced_rate() {
+        let (_dir, cam) = attach_camera_for_tracker(7_101).await;
+        assert_eq!(cam.requested_capture_fps(0.0).await, None, "undisplayed");
+        cam.record_display_size(1, 512, 512).await;
+        assert_eq!(cam.requested_capture_fps(0.0).await, None, "displayed");
+    }
+
+    /// The hum's discriminator is DISPLAY DEMAND, not subscription: a
+    /// subscribed camera nobody is showing hums, and showing it promotes it
+    /// back to the primary rate.
+    #[tokio::test]
+    async fn undisplayed_camera_hums_and_promotes_on_demand() {
+        let (_dir, cam) = attach_camera_for_tracker(7_102).await;
+
+        assert_eq!(
+            cam.requested_capture_fps(2.0).await,
+            Some(2.0),
+            "nothing displaying it -> hum at the ceiling"
+        );
+
+        cam.record_display_size(1, 640, 360).await;
+        assert_eq!(
+            cam.requested_capture_fps(2.0).await,
+            None,
+            "displayed -> primary rate"
+        );
+
+        cam.record_display_size(1, 0, 0).await;
+        assert_eq!(
+            cam.requested_capture_fps(2.0).await,
+            Some(2.0),
+            "display gone -> back to the hum"
+        );
+    }
+
+    /// A forced feed (e.g. a full-resolution recording) has no visible tile but
+    /// must NOT be hummed — it is genuinely being consumed.
+    #[tokio::test]
+    async fn forced_feed_counts_as_displayed() {
+        let (_dir, cam) = attach_camera_for_tracker(7_103).await;
+        assert_eq!(cam.requested_capture_fps(2.0).await, Some(2.0));
+        cam.set_forced(1, true).await;
+        assert_eq!(
+            cam.requested_capture_fps(2.0).await,
+            None,
+            "a forced feed is being consumed, so it runs at the primary rate"
+        );
+        cam.set_forced(1, false).await;
+        assert_eq!(cam.requested_capture_fps(2.0).await, Some(2.0));
+    }
+
+    /// Published state: Off when nobody subscribes, Hum when humming, Ramping
+    /// between promotion and the keyframe, Full once renderable.
+    #[tokio::test]
+    async fn capture_state_reports_the_promotion_sequence() {
+        let (_dir, cam) = attach_camera_for_tracker(7_104).await;
+
+        assert_eq!(
+            cam.capture_state_with(false),
+            CaptureState::Off,
+            "no subscribers -> Off, whatever else is true"
+        );
+
+        use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
+        let track = Arc::new(TrackLocalStaticSample::new(
+            RTCRtpCodecCapability {
+                mime_type: "video/H264".to_owned(),
+                ..Default::default()
+            },
+            "video".to_owned(),
+            "kerbcast-7104".to_owned(),
+        ));
+        cam.add_track(track).await;
+
+        assert_eq!(cam.capture_state_with(true), CaptureState::Hum);
+        assert_eq!(cam.capture_state_with(false), CaptureState::Full);
+
+        // Promotion: renderable only once a keyframe has actually gone out, so
+        // the state stays honest instead of claiming Full while undecodable.
+        cam.begin_ramp();
+        assert_eq!(cam.capture_state_with(false), CaptureState::Ramping);
+        assert!(cam.take_keyframe_request(), "promotion asks for an IDR");
+        assert!(
+            !cam.take_keyframe_request(),
+            "the request is consumed, not re-armed every encode"
+        );
+        assert_eq!(
+            cam.capture_state_with(false),
+            CaptureState::Ramping,
+            "still ramping until the keyframe is actually emitted"
+        );
+        cam.finish_ramp();
+        assert_eq!(cam.capture_state_with(false), CaptureState::Full);
+    }
+
+    /// Nobody asking = no hum, whatever headroom the operator permits. This is
+    /// what lets one install serve a plain viewer and a hum-wanting consumer
+    /// with no configuration on either side.
+    #[tokio::test]
+    async fn no_request_means_no_hum_however_generous_the_ceiling() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reg = CameraRegistry::new(dir.path().to_path_buf());
+        assert_eq!(reg.requested_hum_fps().await, 0.0);
+        assert_eq!(
+            reg.effective_hum_fps().await,
+            0.0,
+            "no consumer asked, so nothing hums"
+        );
+    }
+
+    /// MAX across consumers, and the operator ceiling caps the result.
+    #[tokio::test]
+    async fn hum_requests_aggregate_by_max_and_clamp_to_the_ceiling() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reg = CameraRegistry::new(dir.path().to_path_buf());
+
+        assert!(
+            reg.set_hum_request(1, 1.0).await,
+            "first request changes it"
+        );
+        assert!(reg.set_hum_request(2, 4.0).await, "a higher request wins");
+        assert_eq!(reg.requested_hum_fps().await, 4.0);
+
+        assert!(
+            !reg.set_hum_request(3, 2.0).await,
+            "a lower request doesn't move the max"
+        );
+        assert_eq!(reg.requested_hum_fps().await, 4.0);
+
+        // Ceiling unset (no plugin status yet) means no headroom, so nothing
+        // hums no matter how loudly consumers ask.
+        assert_eq!(reg.hum_ceiling_fps().await, 0.0);
+        assert_eq!(reg.effective_hum_fps().await, 0.0);
+    }
+
+    /// Zero withdraws a request rather than pinning it at zero.
+    #[tokio::test]
+    async fn zero_withdraws_a_hum_request() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reg = CameraRegistry::new(dir.path().to_path_buf());
+        reg.set_hum_request(1, 3.0).await;
+        assert_eq!(reg.requested_hum_fps().await, 3.0);
+        assert!(reg.set_hum_request(1, 0.0).await, "0 withdraws");
+        assert_eq!(reg.requested_hum_fps().await, 0.0);
+    }
+
+    /// The v1.6.3 pin-high class, guarded directly: a departed consumer must
+    /// not leave background capture running for the rest of the session. That
+    /// bug shipped once already because a per-peer max was never cleared on
+    /// teardown, and only a KSP restart recovered it.
+    #[tokio::test]
+    async fn a_departed_consumer_cannot_pin_the_hum_on() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reg = CameraRegistry::new(dir.path().to_path_buf());
+
+        reg.set_hum_request(1, 2.0).await;
+        reg.set_hum_request(2, 5.0).await;
+        assert_eq!(reg.requested_hum_fps().await, 5.0);
+
+        assert!(reg.forget_hum_request(2).await, "the loud peer left");
+        assert_eq!(
+            reg.requested_hum_fps().await,
+            2.0,
+            "max relaxes to the remaining consumer, not stuck at 5"
+        );
+
+        assert!(reg.forget_hum_request(1).await);
+        assert_eq!(
+            reg.requested_hum_fps().await,
+            0.0,
+            "last consumer gone -> hum fully off"
+        );
+        assert!(
+            !reg.forget_hum_request(1).await,
+            "forgetting is idempotent, so a double teardown is harmless"
+        );
     }
 
     /// A manual SetRenderSize acts as a CAP: effective = min(auto_max, manual).

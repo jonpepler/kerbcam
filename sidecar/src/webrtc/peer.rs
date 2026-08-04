@@ -53,10 +53,10 @@ use crate::encoder::selected_backend_name;
 use crate::protocol::{
     CameraSnapshotPayload, CameraStateChangedPayload, ClientMessage, ErrorPayload, ErrorSource,
     FlightIdPayload, HelloPayload, Layer, QualityPreset, ReportDisplaySizePayload,
-    SceneStateChangedPayload, ServerMessage, SetDegradePayload, SetForceFullResolutionPayload,
-    SetFovPayload, SetLayersPayload, SetPanPayload, SetPanRatePayload, SetQualityPayload,
-    SetRenderSizePayload, SetThrottleMainScreenPayload, SetTrackTargetPayload, SetZoomRatePayload,
-    SlotMapPayload,
+    SceneStateChangedPayload, ServerMessage, SetBackgroundCaptureFpsPayload, SetDegradePayload,
+    SetForceFullResolutionPayload, SetFovPayload, SetLayersPayload, SetPanPayload,
+    SetPanRatePayload, SetQualityPayload, SetRenderSizePayload, SetThrottleMainScreenPayload,
+    SetTrackTargetPayload, SetZoomRatePayload, SlotMapPayload,
 };
 
 const CONTROL_CHANNEL_LABEL: &str = "kerbcast-control";
@@ -565,6 +565,17 @@ async fn handle_client_message(
                 .set_forced_full_res(flight_id, peer_id, force)
                 .await;
         }
+        // Background capture ("hum"): this consumer asking that cameras it
+        // isn't displaying keep ticking over instead of stopping. Per-peer and
+        // MAX-aggregated; forgotten on disconnect / peer reap so a departed
+        // consumer can't pin the hum on with nobody watching.
+        ClientMessage::SetBackgroundCaptureFps(SetBackgroundCaptureFpsPayload { fps }) => {
+            if registry.set_hum_request(peer_id, fps).await {
+                // The aggregate moved, so every camera's requested rate has to
+                // be recomputed and pushed down to the plugin.
+                registry.reflush_all_capture_rates().await;
+            }
+        }
         ClientMessage::Disconnect => {
             // Graceful teardown: release every camera this peer is feeding now,
             // so they sleep immediately instead of waiting for the ICE drop to
@@ -581,6 +592,12 @@ async fn handle_client_message(
             // Same peer-scoped sweep for any force this peer held, so a feed
             // never stays pinned at the ceiling after its forcer leaves.
             registry.forget_forced_all(peer_id).await;
+            // And the hum request, or a departed consumer keeps background
+            // capture running for the rest of the session with nobody watching
+            // — the v1.6.3 pin-high class again.
+            if registry.forget_hum_request(peer_id).await {
+                registry.reflush_all_capture_rates().await;
+            }
         }
     }
 }

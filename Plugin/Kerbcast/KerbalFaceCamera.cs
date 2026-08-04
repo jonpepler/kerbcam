@@ -139,6 +139,16 @@ namespace Kerbcast
         // flag. Idle (unsubscribed) kerbal cameras do no render/readback work.
         public bool Subscribed => _subscribed;
 
+        /* Background-hum pacing, same seam and same shared logic as part
+           cameras: a crew face nobody is displaying at size still ticks over so
+           switching to it doesn't cold-start. */
+        private CapturePacing _pacing;
+        public float EffectiveCaptureFps(float primaryFps, float backgroundCeilingFps)
+            => _pacing.Effective(primaryFps, backgroundCeilingFps);
+        public bool CaptureDue(float now, float effectiveFps, float primaryFps)
+            => _pacing.Due(now, effectiveFps, primaryFps);
+        public void MarkCaptureGranted(float now) => _pacing.MarkGranted(now);
+
         public int RefreshFailureStreak { get; set; }
 
         public bool OwnsPart(Part part) => part == _occupiedPart;
@@ -168,8 +178,12 @@ namespace Kerbcast
                 if (snap.Subscribed != _subscribed)
                 {
                     _subscribed = snap.Subscribed;
+                    // Due immediately on resubscribe: a stale interval from
+                    // before the gap must not hold the first frame back.
+                    if (_subscribed) _pacing.Reset();
                     Debug.Log($"[Kerbcast] kerbal cam={FlightId} subscribed → {_subscribed}");
                 }
+                _pacing.RequestedFps = snap.CaptureFps;
 
                 // Auto-resolution: the sidecar writes the effective max-consumer
                 // size into Width/Height (both present-flag gated). A face is

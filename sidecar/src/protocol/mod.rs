@@ -106,6 +106,32 @@ pub enum CameraLifecycle {
     Destroyed,
 }
 
+/// How hard a camera is currently being captured. Reported per camera in
+/// `CameraState` so a consumer renders what is actually happening rather than
+/// predicting it from delay arithmetic.
+///
+/// `Hum` and `Off` only occur when background capture is enabled; with it off
+/// (the default) a subscribed camera is `Full` and an unsubscribed one is `Off`,
+/// which is exactly today's behaviour under the new names.
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum CaptureState {
+    /// Capturing at the primary rate: an ordinary live feed.
+    #[default]
+    Full,
+    /// Promoted and on the way to the primary rate, but not there yet — either
+    /// awaiting the forced keyframe or still rate-limited by the capture budget.
+    Ramping,
+    /// Background capture: recent but sparse. A consumer should present this as
+    /// a reduced-rate channel, not as a live feed.
+    Hum,
+    /// Not being captured at all — unsubscribed, or the background layer has
+    /// been shed under load. A consumer must NOT keep presenting the last frame
+    /// as though it were a live low-rate channel.
+    Off,
+}
+
 /// Distinguishes an existing Hullcam part camera (`Part`) from a
 /// per-kerbal face camera (`Kerbal`).
 #[typeshare]
@@ -152,6 +178,10 @@ pub struct CameraState {
     /// Defaults to `Part` so existing payloads are unaffected.
     #[serde(default)]
     pub kind: CameraKind,
+    /// How hard this camera is currently being captured. Defaults to `Full` so
+    /// existing payloads and pre-hum plugins are unaffected.
+    #[serde(default)]
+    pub capture_state: CaptureState,
     /// The kerbal's real `ProtoCrewMember.persistentID`: the stable key a
     /// consumer correlates against. `None` for part cameras. Distinct from
     /// `flight_id`, which identifies the camera instance, not the kerbal.
@@ -273,6 +303,18 @@ pub struct SetRenderSizePayload {
 pub struct SetForceFullResolutionPayload {
     pub flight_id: u32,
     pub force: bool,
+}
+
+/// Consumer's background-capture ("hum") request. Global rather than
+/// per-camera: it is a statement about how much background cost this consumer
+/// wants spent, not about one camera. Zero stops asking.
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetBackgroundCaptureFpsPayload {
+    /// Requested rate in fps for cameras this consumer is not displaying.
+    /// Clamped to the operator ceiling; 0 means no background capture.
+    pub fps: f32,
 }
 
 /// Which moving thing a pan+zoom camera should auto-aim at. `None` = tracking
@@ -550,6 +592,26 @@ pub enum ClientMessage {
     /// yields to the adaptive framerate shed; overrides only the demand
     /// term, never the perf-protection ceiling.
     SetForceFullResolution(SetForceFullResolutionPayload),
+    /// Ask for background capture (the "hum"): subscribed cameras that this
+    /// consumer is NOT displaying keep capturing at a low rate instead of
+    /// stopping, so switching to one promotes an already-flowing stream rather
+    /// than cold-starting from black.
+    ///
+    /// Per-consumer and MAX-aggregated, like `ReportDisplaySize`: the hum runs
+    /// at the highest rate any connected consumer asked for, and relaxes when
+    /// they lower it or disconnect. A consumer that never sends this pays
+    /// nothing, which is why a stock install needs no configuration to serve
+    /// both a plain viewer and a consumer that wants the hum.
+    ///
+    /// The rate is a REQUEST, not a guarantee. It is clamped to the operator's
+    /// `BackgroundCaptureFps` ceiling and is the first thing dropped when the
+    /// game approaches its framerate floor — watch `CameraState.capture_state`
+    /// for what is actually happening. Send 0 to stop asking.
+    ///
+    /// Receiving the frames is not the same as keeping them: a consumer that
+    /// wants history for a camera it isn't showing has to buffer the humming
+    /// feed itself.
+    SetBackgroundCaptureFps(SetBackgroundCaptureFpsPayload),
     /// Set the camera's field-of-view (degrees). Silently ignored for
     /// parts whose Hullcam module is the fixed base (`supportsZoom ==
     /// false`); clients are expected to clamp to `fovMin / fovMax`
@@ -781,6 +843,7 @@ mod tests {
                 flight_id: 99,
                 lifecycle: CameraLifecycle::Active,
                 kind: CameraKind::Part,
+                capture_state: CaptureState::Full,
                 kerbal_persistent_id: None,
                 crew_location: None,
                 track_mode: TrackMode::None,
@@ -835,6 +898,7 @@ mod tests {
             flight_id: 1,
             lifecycle: CameraLifecycle::Active,
             kind: CameraKind::Part,
+            capture_state: CaptureState::Full,
             kerbal_persistent_id: None,
             crew_location: None,
             track_mode: TrackMode::None,
@@ -1254,6 +1318,7 @@ mod tests {
             flight_id: 42,
             lifecycle: CameraLifecycle::Active,
             kind: CameraKind::Kerbal,
+            capture_state: CaptureState::Full,
             kerbal_persistent_id: Some(123456),
             crew_location: Some(CrewLocation::Eva),
             track_mode: TrackMode::None,

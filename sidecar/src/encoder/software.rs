@@ -254,6 +254,72 @@ mod tests {
         assert!(matches!(err, EncodeError::Invalid(_)));
     }
 
+    /// `Nal::is_keyframe` must actually recognise a real encoder's IDR. The hum
+    /// promotion path depends on it: a promoted camera is published as
+    /// `Ramping` until an IDR is seen in the output, so if this detection is
+    /// wrong the camera never reports `Full` and a consumer's overlay sticks
+    /// forever. Asserted against genuine encoder bytes rather than a
+    /// hand-rolled fixture, since the whole risk is that the real NAL framing
+    /// differs from what the parser assumes.
+    #[test]
+    fn is_keyframe_detects_a_real_encoders_idr() {
+        let mut e = Software::new();
+        e.init(cfg()).unwrap();
+
+        let frame = synthetic_rgba(64, 64, 0);
+        let nals = e
+            .encode(&RawFrame {
+                width: 64,
+                height: 64,
+                data: &frame,
+                capture_ts_ms: 0.0,
+            })
+            .unwrap();
+        assert!(
+            nals.iter().any(|n| n.is_keyframe()),
+            "the first frame is an IDR and must be detected as one"
+        );
+
+        // And it must not fire on every frame, or "promotion complete" would be
+        // meaningless — it'd resolve instantly whether or not an IDR landed.
+        let mut saw_non_keyframe_frame = false;
+        for i in 1..5 {
+            let f = synthetic_rgba(64, 64, i);
+            let out = e
+                .encode(&RawFrame {
+                    width: 64,
+                    height: 64,
+                    data: &f,
+                    capture_ts_ms: i as f64,
+                })
+                .unwrap();
+            if !out.iter().any(|n| n.is_keyframe()) {
+                saw_non_keyframe_frame = true;
+            }
+        }
+        assert!(
+            saw_non_keyframe_frame,
+            "some later frame should be a non-IDR, else detection is vacuous"
+        );
+
+        // An explicit request produces a detectable IDR — the exact call the
+        // promotion path makes.
+        e.request_keyframe();
+        let f = synthetic_rgba(64, 64, 99);
+        let out = e
+            .encode(&RawFrame {
+                width: 64,
+                height: 64,
+                data: &f,
+                capture_ts_ms: 99.0,
+            })
+            .unwrap();
+        assert!(
+            out.iter().any(|n| n.is_keyframe()),
+            "request_keyframe() must yield an IDR the promotion path can see"
+        );
+    }
+
     #[test]
     fn init_then_encode_a_correctly_sized_frame_returns_real_nals() {
         let mut e = Software::new();

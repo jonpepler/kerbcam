@@ -53,6 +53,9 @@ if (block != null)
     // present bit is clear and the reader decodes it as null (not tracking).
     Check(s.TrackMode == null, "trackMode == null (fixture predates the append)");
     Check(s.TrackSeq == 0u, "trackSeq == 0 (fixed field, fixture not tracking)");
+    // capture_fps is a later append on the same terms: the fixture predates it,
+    // so the bit is clear and null means "capture at the primary rate".
+    Check(s.CaptureFps == null, "captureFps == null (fixture predates the append)");
     Check(s.Seq == 2L, "seqlock seq == 2 (exactly one published write)");
 
     // Change detection: re-reading the same (unchanged) block yields nothing.

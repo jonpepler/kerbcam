@@ -30,7 +30,7 @@ use kerbcast_sidecar::encoder::{
 use kerbcast_sidecar::heartbeat::{HeartbeatWatch, HEARTBEAT_FILE};
 use kerbcast_sidecar::protocol::{
     AdaptiveShedPayload, CameraLifecycle, CameraState as ProtocolCameraState,
-    CameraStateChangedPayload, SceneStateChangedPayload, ServerMessage,
+    CameraStateChangedPayload, CaptureState, SceneStateChangedPayload, ServerMessage,
 };
 use kerbcast_sidecar::shared_mem::MmapRingConfig;
 use kerbcast_sidecar::signalling::{router, AppState};
@@ -316,6 +316,14 @@ async fn consume_loop(
             // Status poll piggybacks on the rescan cadence — both are
             // ~1Hz and the plugin's status writer matches that rate.
             let delta = registry.poll_status().await;
+            /* The hum ceiling moved (operator change, or the plugin shedding /
+            restoring the background rung), so every camera's requested
+            capture rate has to be recomputed and pushed back down. Done
+            before the broadcast so a peer's next state read is consistent
+            with what the plugin was just told. */
+            if delta.hum_ceiling_changed {
+                registry.reflush_all_capture_rates().await;
+            }
             if delta.adaptive_shed.is_some()
                 || !delta.changed_cameras.is_empty()
                 || delta.settings.is_some()
@@ -418,6 +426,11 @@ async fn consume_loop(
             // Same peer-scoped sweep for any force this peer held, so a feed
             // never stays pinned at the ceiling after a dead-peer reap.
             registry.forget_forced_all(peer.peer_id).await;
+            // Same for the hum request: a dead peer must not leave background
+            // capture pinned on (the v1.6.3 pin-high class).
+            if registry.forget_hum_request(peer.peer_id).await {
+                registry.reflush_all_capture_rates().await;
+            }
         }
 
         let cameras = registry.snapshot().await;
@@ -518,6 +531,8 @@ async fn broadcast_destroyed_cameras(
         let state = ProtocolCameraState {
             flight_id,
             lifecycle: CameraLifecycle::Destroyed,
+            // Destroyed: nothing is being captured, whatever subscribers linger.
+            capture_state: CaptureState::Off,
             kind: cam.kind,
             kerbal_persistent_id: cam.kerbal_persistent_id,
             crew_location: cam.crew_location(),
@@ -774,6 +789,12 @@ async fn encode_and_fan_out(
     let backend_name = encoder.name();
     let backend_is_hardware = encoder.is_hardware();
 
+    /* Consume any pending promotion keyframe request before encoding, so the
+    IDR rides the very next frame rather than waiting out the periodic GOP. */
+    if cam.take_keyframe_request() {
+        encoder.request_keyframe();
+    }
+
     let nals = match encoder.encode(&RawFrame {
         width: frame.width,
         height: frame.height,
@@ -782,6 +803,14 @@ async fn encode_and_fan_out(
     }) {
         Ok(n) => {
             cam.encode_failure_streak.store(0, Ordering::Release);
+            /* A promotion is complete once a keyframe actually goes out — that
+            is the moment the feed becomes renderable, so it's what flips the
+            published state from Ramping to Full. Keyed on a real IDR in the
+            output rather than on time elapsed, so a slow ramp reports
+            honestly instead of claiming Full while still undecodable. */
+            if cam.ramping.load(Ordering::Acquire) && n.iter().any(|nal| nal.is_keyframe()) {
+                cam.finish_ramp();
+            }
             n
         }
         Err(e) => {

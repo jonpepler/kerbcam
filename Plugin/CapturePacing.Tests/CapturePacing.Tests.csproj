@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Standalone tests for CapturePacing.cs — the background-hum rate decisions.
+    Compiles ONLY the Unity-free logic (no KSP/Unity assemblies needed), same
+    approach as ControlBlock.Tests and ShedController.Tests. Run: `dotnet run`.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <!-- Disabled to mirror the net48 plugin's context, so this harness compiles
+         CapturePacing.cs exactly as the plugin does. -->
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <!-- This is a dev test harness, not part of the shipped plugin. -->
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="../Kerbcast/CapturePacing.cs" />
+  </ItemGroup>
+
+</Project>
