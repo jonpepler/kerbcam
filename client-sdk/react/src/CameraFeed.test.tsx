@@ -272,6 +272,7 @@ function renderFeed(
     renderSize?: "auto" | "none";
     enableQualityControl?: boolean;
     enableTracking?: boolean;
+    disableManualControls?: boolean;
     enableRecording?: boolean;
     recordFullResolution?: boolean;
     enableFullscreen?: boolean;
@@ -2013,6 +2014,97 @@ describe("CameraFeed - tracking (crosshair)", () => {
     });
     expect((getByLabelText("Zoom in") as HTMLButtonElement).disabled).toBe(false);
     expect((getByLabelText("Pan left") as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  // -------------------------------------------------------------------------
+  // disableManualControls: a host taking over the hand-flown path
+  // -------------------------------------------------------------------------
+
+  it("shows the manual pan + zoom controls by default", async () => {
+    const { client } = await buildConnectedSource([panZoomCam()]);
+    const { queryByLabelText } = renderFeed(client, { flightId: 42 });
+    expect(queryByLabelText("Zoom in")).not.toBeNull();
+    expect(queryByLabelText("Pan camera")).not.toBeNull();
+  });
+
+  it("removes the manual pan + zoom controls when disableManualControls", async () => {
+    const { client } = await buildConnectedSource([panZoomCam()]);
+    const { queryByLabelText } = renderFeed(client, {
+      flightId: 42,
+      disableManualControls: true,
+    });
+    // Gone, not merely disabled: a host owning control shouldn't have to
+    // occlude ours.
+    expect(queryByLabelText("Zoom in")).toBeNull();
+    expect(queryByLabelText("Zoom out")).toBeNull();
+    expect(queryByLabelText("Pan camera")).toBeNull();
+    expect(queryByLabelText("Pan left")).toBeNull();
+  });
+
+  it("keeps auto-track live when disableManualControls: the aim loop is not manual", async () => {
+    const { client } = await buildConnectedSource([panZoomCam()]);
+    const { queryByLabelText } = renderFeed(client, {
+      flightId: 42,
+      enableTracking: true,
+      disableManualControls: true,
+    });
+    expect(queryByLabelText(/track/i)).not.toBeNull();
+  });
+
+  const panRates = (sidecar: MockSidecar) =>
+    sidecar.commands.filter((c) => c.type === "set-pan-rate");
+
+  it("no-ops the imperative pan/zoom handle when disableManualControls", async () => {
+    // Covers the serial-controller path: a host that hides the on-screen
+    // controls must not be reachable through the handle either.
+    const { client, sidecar } = await buildConnectedSource([panZoomCam()]);
+
+    const handleRef = createRef<CameraFeedHandle>();
+    renderFeed(client, {
+      flightId: 42,
+      disableManualControls: true,
+      ref: handleRef,
+    });
+
+    await act(async () => {
+      handleRef.current?.setPanAxis("yaw", 1);
+      handleRef.current?.nudgePan(1, 0);
+      handleRef.current?.setZoomRate(1);
+      handleRef.current?.nudgeZoom(1);
+    });
+
+    expect(panRates(sidecar)).toHaveLength(0);
+  });
+
+  it("zeroes an in-flight pan rate when disableManualControls flips on", async () => {
+    const { client, sidecar } = await buildConnectedSource([panZoomCam()]);
+
+    const handleRef = createRef<CameraFeedHandle>();
+    const { rerender } = render(
+      <KerbcastProvider client={client}>
+        <CameraFeed ref={handleRef} flightId={42} />
+      </KerbcastProvider>,
+    );
+
+    await act(async () => {
+      handleRef.current?.setPanAxis("yaw", 1);
+    });
+    expect(panRates(sidecar).length).toBeGreaterThan(0);
+
+    // Handing control over mid-pan must not leave the gimbal running.
+    await act(async () => {
+      rerender(
+        <KerbcastProvider client={client}>
+          <CameraFeed ref={handleRef} flightId={42} disableManualControls />
+        </KerbcastProvider>,
+      );
+    });
+
+    expect(sidecar.lastCommand("set-pan-rate")?.content).toMatchObject({
+      flightId: 42,
+      yawRate: 0,
+      pitchRate: 0,
+    });
   });
 });
 

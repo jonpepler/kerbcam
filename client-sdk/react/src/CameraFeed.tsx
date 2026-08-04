@@ -221,6 +221,25 @@ export interface CameraFeedProps {
    */
   enableTracking?: boolean;
   /**
+   * Stand down the built-in MANUAL camera controls: the pan ball and the
+   * zoom/FoV controls disappear, their in-flight rates are zeroed, and the
+   * imperative handle's pan/zoom methods become no-ops (so a physical
+   * controller wired to the handle can't reach the camera either).
+   *
+   * "Manual" in the sense this file already uses it - a human directly driving
+   * the gimbal and optics - and named for that intent rather than for today's
+   * specific surfaces, so anything added later that hand-flies the camera
+   * stands down under this flag too. Auto-track is NOT manual and stays live:
+   * the aim loop runs game-side, so it keeps working when a host takes the
+   * hand-flown path away. Feed affordances are untouched as well - action bar,
+   * recording, fullscreen, PiP, quality.
+   *
+   * For a host that owns manual control itself, e.g. a signal-delay setpoint
+   * surface where live pan/zoom would be steering at where the craft is now
+   * while watching where it was a light-time ago. Default false.
+   */
+  disableManualControls?: boolean;
+  /**
    * Show a built-in REC control in the action bar: a STATEFUL toggle (never
    * overflow-eligible, per the #6 spec) that starts/stops a client-side
    * recording of this feed via `useRecordings()`. Idle -> click starts
@@ -302,6 +321,7 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
       enablePictureInPicture = false,
       enableQualityControl = false,
       enableTracking = false,
+      disableManualControls = false,
       enableRecording = false,
       recordFullResolution = false,
       actions,
@@ -496,8 +516,12 @@ const CameraFeedInner = forwardRef<CameraFeedHandle, CameraFeedProps>(
     }, []);
 
     const isDestroyed = camera ? isCameraDestroyed(camera) : false;
-    const showPan = camera?.supportsPan && !isDestroyed;
-    const showZoom = camera?.supportsZoom && !isDestroyed;
+    /* Gating here rather than at the render sites covers the whole manual
+       path at once: the controls unmount, the effects below zero any in-flight
+       rate, and the imperative handle's pan/zoom methods no-op. */
+    const showPan = camera?.supportsPan && !isDestroyed && !disableManualControls;
+    const showZoom =
+      camera?.supportsZoom && !isDestroyed && !disableManualControls;
 
     // Auto-track state is server-authoritative: driven purely by the published
     // trackMode (absent -> none), never local click. While tracking, the aim
