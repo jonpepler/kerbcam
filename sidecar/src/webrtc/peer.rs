@@ -152,8 +152,21 @@ impl KerbcastPeer {
         let mut senders: Vec<Arc<RTCRtpSender>> = Vec::with_capacity(slot_count);
         for i in 0..slot_count {
             let track = Arc::new(TrackLocalStaticSample::new(
+                /* Declare the fmtp explicitly. With only a mime type here, codec
+                matching falls back to a mime-only fuzzy search across every
+                H.264 payload type the browser offered — including
+                packetization-mode=0 ones, which permit single-NAL packets
+                only. Our encoder emits fragmented and aggregated NALs, so
+                landing on such a payload type yields RTP the browser accepts
+                and cannot decode: traffic on the wire, readyState stuck at 0,
+                and not one error anywhere in the stack. Pinning
+                packetization-mode=1 with the constrained-baseline profile
+                every browser offers makes the choice deterministic. */
                 RTCRtpCodecCapability {
                     mime_type: MIME_TYPE_H264.to_owned(),
+                    sdp_fmtp_line:
+                        "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
+                            .to_owned(),
                     ..Default::default()
                 },
                 format!("video-slot{i}"),
@@ -301,6 +314,35 @@ impl KerbcastPeer {
             for (slot, tr) in slots.iter_mut().zip(transceivers.iter()) {
                 slot.mid = tr.mid().map(|m| m.to_string());
             }
+            /* A slot with no mid never matched an m-line, so its track was
+            never bound to a sender. write_sample() on such a track returns
+            Ok and silently discards the frame — the exact shape of a black
+            feed with a healthy-looking pipeline. Loud, because nothing
+            downstream can tell you this happened. */
+            let unbound: Vec<usize> = slots
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.mid.is_none())
+                .map(|(i, _)| i)
+                .collect();
+            if !unbound.is_empty() {
+                warn!(
+                    unbound_slots = ?unbound,
+                    total_slots = slots.len(),
+                    transceivers = transceivers.len(),
+                    "slots have NO negotiated mid — their tracks are unbound and \
+                     every write_sample on them is silently dropped"
+                );
+            }
+            for (i, (slot, tr)) in slots.iter().zip(transceivers.iter()).enumerate() {
+                info!(
+                    slot = i,
+                    mid = ?slot.mid,
+                    direction = ?tr.direction(),
+                    current_direction = ?tr.current_direction(),
+                    "slot negotiation result"
+                );
+            }
         }
 
         let local = self
@@ -308,6 +350,21 @@ impl KerbcastPeer {
             .local_description()
             .await
             .ok_or_else(|| anyhow!("local description missing after set_local_description"))?;
+
+        /* Which H.264 payload type and fmtp actually got negotiated. The slot
+        tracks declare only a mime type (no sdp_fmtp_line), so codec matching
+        falls back to a mime-only fuzzy search and can land on a payload type
+        whose parameters our encoder does not satisfy — packetization-mode or
+        profile-level-id in particular. That produces RTP the browser accepts
+        but cannot decode: traffic on the wire, readyState stuck at 0. */
+        for line in local.sdp.lines() {
+            if line.starts_with("a=rtpmap:") && line.to_ascii_uppercase().contains("H264") {
+                info!(sdp_line = line, "negotiated H264 rtpmap");
+            }
+            if line.starts_with("a=fmtp:") {
+                info!(sdp_line = line, "negotiated fmtp");
+            }
+        }
         Ok(local.sdp)
     }
 
