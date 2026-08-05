@@ -65,71 +65,75 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Unity Hub's postinst calls update-desktop-database, which is absent on
-      # the runner image. The script fails, the package never finishes
-      # configuring, and /opt/unityhub/unityhub is never created — so
-      # buildalon/unity-setup dies with ENOENT before Unity starts. That
-      # silently disabled this workflow (and so ALL orientation coverage) from
-      # 2026-07-23. Supplying the tool lets the postinst complete.
-      - name: Install a Unity Hub version the setup action can find
-        # Linux only: apt does not exist on the Windows runner.
-        #
-        # Hub 3.20 moved its binary to /usr/lib/unityhub/unityhub, while
-        # buildalon/unity-setup requires an install at /opt/unityhub/unityhub —
-        # and symlinking the expected path is not enough, the action's own
-        # is-installed check still rejects it. So pin the newest pre-3.20 Hub,
-        # which installs where the action expects. Its postinst also calls
-        # update-desktop-database, absent on the runner, so install that first
-        # or the package never finishes configuring.
-        #
-        # This is why the shader workflow had no green run after 2026-07-23 and
-        # why the v1.9.0 GameData bundle failed: the runner silently moved to
-        # 3.20. Print the candidates so the next drift is visible, not silent.
-        if: runner.os == 'Linux'
+      # No Unity Hub on Linux. Hub is an Electron desktop app; driving it
+      # headlessly on a runner is what broke here — the runner image moved to
+      # Hub 3.20, which relocated its binary out of /opt/unityhub, and
+      # buildalon/unity-setup still probes the old path (upstream
+      # buildalon/unity-setup#57; the fix, RageAgainstThePixel/unity-cli#81, is
+      # open and unreleased). Even with a pinned pre-3.20 Hub the headless
+      # install returned in 3 seconds having installed nothing.
+      #
+      # We already pin the exact version AND changeset, and Unity publishes both
+      # as plain tarballs, so fetch them directly: deterministic, cacheable, and
+      # immune to Hub/runner drift. Only the licence still has to reach Unity.
+      - name: Resolve Unity version + changeset
+        id: unity
+        run: |
+          set -eu
+          FULL="${{ env.UNITY_VERSION }}"          # e.g. "2019.4.40f1 (ffc62b691db5)"
+          VER="${FULL%% *}"
+          CS="$(printf '%s' "$FULL" | sed -E 's/.*\(([0-9a-f]+)\).*/\1/')"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "changeset=$CS" >> "$GITHUB_OUTPUT"
+          echo "resolved Unity $VER changeset $CS"
+
+      - name: Restore cached Unity Editor
+        id: unity-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/unity-editor
+          key: unity-linux-${{ steps.unity.outputs.version }}-${{ steps.unity.outputs.changeset }}-mac-mono-v1
+
+      - name: Download Unity Editor + Mac support (cache miss only)
+        if: steps.unity-cache.outputs.cache-hit != 'true'
+        env:
+          VER: ${{ steps.unity.outputs.version }}
+          CS: ${{ steps.unity.outputs.changeset }}
         run: |
           set -eux
-          sudo apt-get update -qq
-          sudo apt-get install -y desktop-file-utils
-          wget -qO- https://hub.unity3d.com/linux/keys/public \
-            | gpg --dearmor \
-            | sudo tee /usr/share/keyrings/Unity_Technologies_ApS.gpg >/dev/null
-          sudo sh -c 'echo "deb [signed-by=/usr/share/keyrings/Unity_Technologies_ApS.gpg] https://hub.unity3d.com/linux/repos/deb stable main" > /etc/apt/sources.list.d/unityhub.list'
-          sudo apt-get update -qq
-          echo "=== available unityhub versions ==="
-          apt-cache madison unityhub || true
-          VER="$(apt-cache madison unityhub | awk '{print $3}' | grep -v '^3\.20' | head -1)"
-          echo "pinning unityhub ${VER:-<none found, using latest>}"
-          if [ -n "$VER" ]; then
-            # An apt PIN, not apt-mark hold: the setup action runs its own
-            # `apt-get install unityhub`, and a hold makes that fail with
-            # exit 100. A pin keeps the version fixed while letting the
-            # action's install succeed against it.
-            printf 'Package: unityhub\nPin: version %s\nPin-Priority: 1001\n' "$VER" \
-              | sudo tee /etc/apt/preferences.d/unityhub >/dev/null
-            sudo apt-get install -y "unityhub=$VER"
-          else
-            sudo apt-get install -y unityhub
-          fi
-          ls -la /opt/unityhub || true
-          # The action spawns a binary called `unity-hub` (hyphenated); the
-          # package provides `unityhub`. Without this alias it fails with
-          # "spawn unity-hub ENOENT" even though Hub is correctly installed.
-          if [ -x /opt/unityhub/unityhub ] && [ ! -e /usr/bin/unity-hub ]; then
-            sudo ln -sf /opt/unityhub/unityhub /usr/bin/unity-hub
-          fi
-          command -v unity-hub unityhub || true
+          BASE="https://download.unity3d.com/download_unity/${CS}"
+          mkdir -p ~/unity-editor
+          # Editor itself.
+          curl -fsSL --retry 3 --retry-delay 5 \
+            "${BASE}/LinuxEditorInstaller/Unity.tar.xz" -o /tmp/unity.tar.xz
+          tar -xf /tmp/unity.tar.xz -C ~/unity-editor
+          rm -f /tmp/unity.tar.xz
+          # Mac mono support, so the Linux editor can compile the metal variants
+          # for the macOS bundle. Target installers are per-HOST, so this is the
+          # Linux-hosted flavour, not the .pkg a Mac would use.
+          curl -fsSL --retry 3 --retry-delay 5 \
+            "${BASE}/LinuxEditorTargetInstaller/UnitySetup-Mac-Mono-Support-for-Editor-${VER}.tar.xz" \
+            -o /tmp/mac-mono.tar.xz
+          tar -xf /tmp/mac-mono.tar.xz -C ~/unity-editor
+          rm -f /tmp/mac-mono.tar.xz
 
-      - name: Set up Unity Hub + Editor
-        uses: buildalon/unity-setup@v2
-        with:
-          unity-version: ${{ env.UNITY_VERSION }}
-          version-file: 'None'
-          # mac-mono lets the Linux editor compile the metal variants for the
-          # macOS bundle. The Windows bundle builds on its own runner (see
-          # the header), so windows-mono is no longer installed here.
-          build-targets: StandaloneLinux64
-          modules: mac-mono
-          cache-installation: true
+      - name: Locate the editor binary
+        run: |
+          set -eu
+          EDITOR="$(find ~/unity-editor -maxdepth 3 -type f -name Unity -perm -u+x | head -1)"
+          test -n "$EDITOR"
+          echo "UNITY_EDITOR_PATH=$EDITOR" >> "$GITHUB_ENV"
+          echo "editor: $EDITOR"
+          "$EDITOR" -version 2>/dev/null || true
+
+      # Unity refuses to run headless without the graphics/audio libs the
+      # Hub install would have pulled in as dependencies.
+      - name: Install Unity runtime libraries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            libgtk-3-0 libnss3 libasound2 libgconf-2-4 libxtst6 libxss1 \
+            libgbm1 libnotify4 xvfb desktop-file-utils || true
 
       - name: Activate Unity Personal license
         uses: buildalon/activate-unity-license@v2
