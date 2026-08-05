@@ -79,6 +79,31 @@ namespace KerbcastCI
                 }
 
                 CheckFilterBranch("filter-probe", src, failures);
+
+                /* SHIPPED-CHAIN branches: the same passes with CaptureCore's
+                   final correction appended, which is what a viewer actually
+                   receives. An UNFILTERED camera (plain) and a FILTERED one
+                   (filter-probe) traverse different flip gates, so both are
+                   proven — a mismatch between the two shows up as one branch
+                   upright and the other mirrored, which is precisely the
+                   "some cameras look flipped and others don't" report. */
+                Debug.Log("[Kerbcast-CI] --- shipped chain (blit + CaptureCore correction) ---");
+                CheckBranch("plain+capture", (s, d) => Graphics.Blit(s, d), src, failures,
+                    captureTail: true);
+
+                Material nv2 = LoadNightVisionMaterial();
+                nv2.SetFloat("_Gain", 4f);
+                try
+                {
+                    CheckBranch("nightvision+capture", (s, d) => Graphics.Blit(s, d, nv2), src,
+                        failures, captureTail: true);
+                }
+                finally
+                {
+                    UnityEngine.Object.DestroyImmediate(nv2);
+                }
+
+                CheckFilterBranch("filter-probe+capture", src, failures, captureTail: true);
             }
             finally
             {
@@ -105,7 +130,7 @@ namespace KerbcastCI
            failure so the CI log names the error class. */
         private static void CheckBranch(
             string name, Action<RenderTexture, RenderTexture> pass,
-            RenderTexture src, List<string> failures)
+            RenderTexture src, List<string> failures, bool captureTail = false)
         {
             var dst = new RenderTexture(_w, _h, 0, RenderTextureFormat.ARGB32)
             {
@@ -115,7 +140,13 @@ namespace KerbcastCI
             try
             {
                 pass(src, dst);
-                string layout = ClassifyCorners(ReadBack(dst));
+                /* The SHIPPED chain does not stop at the blit: CaptureCore
+                   applies one more orientation correction before the readback,
+                   gated the opposite way to HullcamFilterBlit's. Proving the
+                   blit branch alone leaves that final flip untested, which is
+                   how a mirrored feed ships with this test green. */
+                if (captureTail) Kerbcast.CaptureOrientation.ApplyReadbackFlip(dst);
+                string layout = ClassifyCorners(captureTail ? ReadBackAsync(dst) : ReadBack(dst));
                 if (layout == "identity")
                     Debug.Log($"[Kerbcast-CI]   ok   {name}: corners upright (identity)");
                 else
@@ -140,7 +171,8 @@ namespace KerbcastCI
            second, latent bug this harness exists to surface. Rig construction
            mirrors HullcamBlitDeterminism. The private material Run builds keeps
            the shader default _Gain (4), matching the marker levels. */
-        private static void CheckFilterBranch(string name, RenderTexture src, List<string> failures)
+        private static void CheckFilterBranch(string name, RenderTexture src, List<string> failures,
+            bool captureTail = false)
         {
             var dst = new RenderTexture(_w, _h, 0, RenderTextureFormat.ARGB32)
             {
@@ -157,7 +189,9 @@ namespace KerbcastCI
                    blits through whatever the static currently holds. */
                 FakeCameraFilterStatics.SharedMaterial = shared;
                 rig.Run((s, d) => Graphics.Blit(s, d, FakeCameraFilterStatics.SharedMaterial), src, dst);
-                string layout = ClassifyCorners(ReadBack(dst));
+                // Shipped chain: CaptureCore's correction follows the filter pass.
+                if (captureTail) Kerbcast.CaptureOrientation.ApplyReadbackFlip(dst);
+                string layout = ClassifyCorners(captureTail ? ReadBackAsync(dst) : ReadBack(dst));
                 if (layout == "identity")
                     Debug.Log($"[Kerbcast-CI]   ok   {name}: probe kept corners upright (identity)");
                 else
@@ -260,6 +294,25 @@ namespace KerbcastCI
             tex.SetPixels32(px);
             tex.Apply();
             return tex;
+        }
+
+        /* Readback the way the SHIPPED path does. This is not a detail: the
+           capture chain's final correction exists solely to undo the vertical
+           inversion AsyncGPUReadback returns on bottom-left-origin APIs, and
+           ReadPixels does not have that inversion. Proving the correction with
+           a ReadPixels readback therefore measures a chain that does not exist
+           — it would fail a correct pipeline and pass a broken one. Any branch
+           asserting the shipped chain must come through here. */
+        private static byte[] ReadBackAsync(RenderTexture rt)
+        {
+            var req = UnityEngine.Rendering.AsyncGPUReadback.Request(rt, 0, TextureFormat.RGBA32);
+            req.WaitForCompletion();
+            if (req.hasError)
+            {
+                Debug.LogWarning("[Kerbcast-CI] AsyncGPUReadback failed; falling back to ReadPixels");
+                return ReadBack(rt);
+            }
+            return req.GetData<byte>().ToArray();
         }
 
         private static byte[] ReadBack(RenderTexture rt)

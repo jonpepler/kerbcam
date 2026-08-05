@@ -44,6 +44,9 @@ on:
       # and the committed Hullcam shader bundle the determinism test loads.
       - 'Plugin/Kerbcast/Fx/Core/**'
       - 'Plugin/Kerbcast/HullcamBlit/**'
+      # The capture path's final orientation correction. Shared with the
+      # shipped chain, so a change here must re-run the orientation proof.
+      - 'Plugin/Kerbcast/CaptureOrientation/**'
       - 'GameData/Kerbcast/HullcamShaders/**'
       - '.github/workflows/build-kerbcast-shaders.yml'
   workflow_dispatch:

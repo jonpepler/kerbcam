@@ -730,6 +730,23 @@ namespace Kerbcast
             nearGo.transform.parent = nearParent;
             nearGo.transform.localPosition = nearLocalPos;
             nearGo.transform.localRotation = _baseRotation;
+            /* Handedness probe. A mirrored image cannot come from our blit chain
+               (every flip we apply is vertical) nor from LookRotation, so the
+               remaining source is a NEGATIVE-DETERMINANT parent chain — what KSP
+               mirror-symmetry placement produces. Log the determinant sign once
+               per camera so a flipped feed can be attributed to the mount rather
+               than guessed at. Cheap and one-shot; runs at camera setup only. */
+            {
+                var m = nearGo.transform.localToWorldMatrix;
+                float det = m.determinant;
+                var ps = nearParent != null ? nearParent.lossyScale : Vector3.one;
+                var cs = nearGo.transform.lossyScale;
+                Debug.Log(
+                    $"[Kerbcast][MOUNTDIAG] cam={FlightId} part={Mount.PartName} " +
+                    $"parentScale=({ps.x:F3},{ps.y:F3},{ps.z:F3}) " +
+                    $"camScale=({cs.x:F3},{cs.y:F3},{cs.z:F3}) det={det:F4} " +
+                    (det < 0f ? "<<< MIRRORED PARENT CHAIN" : "upright"));
+            }
             _nearCam.fieldOfView = Fov;
             _nearCam.nearClipPlane = Mount.NearClip;
             _nearCam.targetTexture = _capture.CaptureRt;
