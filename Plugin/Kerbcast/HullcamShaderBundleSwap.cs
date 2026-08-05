@@ -18,6 +18,18 @@
 // well before Flight scene entry, where MovieTime.Awake → CameraFilter.InitializeAssets
 // → CameraFilter.LoadShaderFile → CameraFilter.LoadBundle would fire.
 //
+// Interception alone is not enough, though, and relying on it was a bug: a
+// Startup.Instantly addon is a MonoBehaviour on an ordinary scene GameObject,
+// so Unity destroys it at the FIRST scene change (loading → main menu), long
+// before Hullcam touches LoadBundle in the flight scene. An OnDestroy that
+// unpatched Harmony therefore removed the prefix during the loading screen and
+// Hullcam went on to load its own 2017-era bundle: shaders "load" fine and
+// every filtered camera renders pure black. So the swap now (a) never
+// unpatches, and (b) does not depend on the prefix firing at all -- it loads
+// the replacement bundle and marks CameraFilter.BundleLoaded up front, which
+// makes Hullcam's own LoadBundle a no-op whenever it eventually runs. The
+// prefix stays as a second line of defence.
+//
 // Graceful degradation:
 //   - Non-Linux platform: patch is never applied.
 //   - HullcamVDS not installed: assembly lookup returns null; no patch applied.
@@ -67,6 +79,18 @@ namespace Kerbcast
             {
                 Debug.LogError($"[Kerbcast-ShaderSwap] failed to apply Harmony patch: {ex}");
             }
+
+            /* Do the swap now rather than waiting to intercept: this addon is
+               destroyed at the first scene change, so the prefix cannot be
+               relied on to still be live when Hullcam calls LoadBundle. */
+            try
+            {
+                CameraFilterLoadBundlePatch.PreloadReplacement();
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[Kerbcast-ShaderSwap] replacement preload threw; HullcamVDS will load its own bundle: {ex}");
+            }
         }
 
         private static void ApplyPatch()
@@ -101,11 +125,10 @@ namespace Kerbcast
             Debug.Log("[Kerbcast-ShaderSwap] Harmony prefix applied to CameraFilter.LoadBundle");
         }
 
-        private void OnDestroy()
-        {
-            _harmony?.UnpatchAll(HarmonyId);
-            _harmony = null;
-        }
+        /* Deliberately no OnDestroy/UnpatchAll: Unity destroys this addon's
+           GameObject at the first scene change, and unpatching there removed
+           the prefix before HullcamVDS ever reached LoadBundle. The patch is
+           process-lifetime, as it must be. */
     }
 
     /// <summary>
@@ -139,6 +162,22 @@ namespace Kerbcast
                 Debug.LogError($"[Kerbcast-ShaderSwap] prefix threw; falling back to original LoadBundle: {ex}");
                 return true; // run original
             }
+        }
+
+        /// <summary>
+        /// Perform the swap up front, at addon startup, instead of waiting for
+        /// HullcamVDS to call LoadBundle. On success CameraFilter.BundleLoaded
+        /// is set, so Hullcam's own LoadBundle early-returns whenever it runs
+        /// and the outcome no longer depends on the prefix being installed.
+        /// On any failure nothing is changed and Hullcam behaves as usual.
+        /// </summary>
+        public static void PreloadReplacement()
+        {
+            // RunPrefix returns false when the replacement is in place.
+            if (!RunPrefix())
+                Debug.Log("[Kerbcast-ShaderSwap] replacement bundle installed ahead of HullcamVDS");
+            else
+                Debug.LogWarning("[Kerbcast-ShaderSwap] preload did not install the replacement; HullcamVDS will load its own bundle");
         }
 
         private static bool RunPrefix()
@@ -222,6 +261,15 @@ namespace Kerbcast
             // Release the bundle file handle; shaders survive because
             // AssetBundle.Unload(false) keeps already-loaded Unity objects.
             bundle.Unload(false);
+
+            /* Never claim the bundle is loaded on an empty read: marking
+               BundleLoaded would make Hullcam's own LoadBundle early-return and
+               leave the filters with no shader at all. */
+            if (count == 0)
+            {
+                Debug.LogWarning("[Kerbcast-ShaderSwap] replacement bundle contained no shaders; running original LoadBundle");
+                return true;
+            }
 
             _bundleLoadedField.SetValue(null, true);
             Debug.Log($"[Kerbcast-ShaderSwap] replacement bundle loaded; {count} shader(s) registered");
