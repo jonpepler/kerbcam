@@ -88,13 +88,20 @@ jobs:
           hub="$(command -v unityhub || true)"
           echo "on PATH: ${hub:-<none>}"
           sudo mkdir -p /opt/unityhub
-          if [ ! -e /opt/unityhub/unityhub ]; then
-            target="$(dpkg -L unityhub | grep -E '/unityhub(-bin)?$' | grep -v '^/opt/unityhub/unityhub$' | head -1)"
-            [ -z "$target" ] && target="$hub"
-            echo "linking /opt/unityhub/unityhub -> ${target:-<none>}"
-            [ -n "$target" ] && sudo ln -sf "$(readlink -f "$target")" /opt/unityhub/unityhub
+          # Must be the EXECUTABLE, not the package directory: linking the dir
+          # satisfies the path probe and then fails "Unity Hub is not installed".
+          target=""
+          for c in /usr/lib/unityhub/unityhub /usr/lib/unityhub/unityhub-bin \
+                   /opt/unityhub/unityhub-bin "$hub"; do
+            if [ -f "$c" ] && [ -x "$c" ]; then target="$c"; break; fi
+          done
+          echo "hub executable: ${target:-<none>}"
+          if [ -n "$target" ] && [ ! -f /opt/unityhub/unityhub ]; then
+            sudo rm -f /opt/unityhub/unityhub
+            sudo ln -sf "$(readlink -f "$target")" /opt/unityhub/unityhub
           fi
-          ls -la /opt/unityhub || true
+          ls -la /opt/unityhub /usr/lib/unityhub 2>/dev/null | head -20 || true
+          /opt/unityhub/unityhub --headless help 2>&1 | head -5 || true
 
       - name: Set up Unity Hub + Editor
         uses: buildalon/unity-setup@v2
