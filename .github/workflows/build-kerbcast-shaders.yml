@@ -188,6 +188,79 @@ jobs:
           username: ${{ secrets.UNITY_USERNAME }}
           password: ${{ secrets.UNITY_PASSWORD }}
 
+      - name: Build kerbcast-shaders AssetBundles (linux, osx)
+        working-directory: ci/kerbcast-shaders
+        run: |
+          "$UNITY_EDITOR_PATH" \
+            -batchmode -nographics -quit \
+            -projectPath "$(pwd)" \
+            -executeMethod KerbcastCI.BuildKerbcastShaders.BuildUnix \
+            -buildTarget Linux64 \
+            -logFile -
+          echo "--- output bundles ---"
+          ls -la Bundles-linux/ Bundles-osx/
+
+      # Both render tests below need a real graphics device: `-nographics`
+      # disables it entirely, turning Camera.Render(), Graphics.Blit and
+      # RenderTexture readback into no-ops. xvfb gives the runner a virtual
+      # display for the GL context.
+      - name: Install xvfb
+        run: sudo apt-get update && sudo apt-get install -y xvfb
+
+      # Per-shader render smoke test on the just-built Linux bundle: every
+      # shader in it must report isSupported, render through a material onto
+      # a small deterministic scene, and produce output that is neither the
+      # magenta error pattern nor all-zero. This run executes the glcore
+      # variants ONLY; it cannot validate the d3d11 blobs in the Windows
+      # bundle (see the build-windows job). Judging how the FX actually LOOK
+      # stays with the fx-previews.yml renders.
+      - name: Shader render smoke test (Linux bundle, glcore)
+        working-directory: ci/kerbcast-shaders
+        timeout-minutes: 10
+        run: |
+          xvfb-run -a "$UNITY_EDITOR_PATH" \
+            -batchmode -quit \
+            -projectPath "$(pwd)" \
+            -executeMethod KerbcastCI.ShaderSmoke.RenderAll \
+            -buildTarget Linux64 \
+            -logFile -
+
+      # Regression net for the per-camera Hullcam filter blit (c00fe16):
+      # compiles the plugin's HullcamFilterBlit.cs verbatim (via the
+      # Assets/Editor/SharedHullcamBlit symlink), loads the committed
+      # GameData/Kerbcast/HullcamShaders/shaders.linux MovieTime shader, and
+      # asserts each filter mode's blit output is byte-identical under
+      # hostile writes to the shared static material (plus reticle on/off
+      # policy vs a no-title baseline, plus a control that the legacy
+      # shared-static path visibly flickers). Same xvfb arrangement as the
+      # smoke test: -nographics would no-op Graphics.Blit and ReadPixels.
+      - name: Hullcam filter blit determinism test
+        working-directory: ci/kerbcast-shaders
+        timeout-minutes: 10
+        run: |
+          xvfb-run -a "$UNITY_EDITOR_PATH" \
+            -batchmode -quit \
+            -projectPath "$(pwd)" \
+            -executeMethod KerbcastCI.HullcamBlitDeterminism.RunAll \
+            -buildTarget Linux64 \
+            -logFile -
+
+      # Camera-orientation proof: a four-corner marker frame blitted through
+      # each capture blit branch (plain / NightVision / filter-probe) must come
+      # back with every corner unmoved. Catches the NightVision d3d11 upside-
+      # down bug (GitHub #5) and exercises the HullcamFilterBlit probe. glcore
+      # here; the Windows job runs the d3d11 side. Same xvfb arrangement.
+      - name: Camera orientation proof (Linux bundle, glcore)
+        working-directory: ci/kerbcast-shaders
+        timeout-minutes: 10
+        run: |
+          xvfb-run -a "$UNITY_EDITOR_PATH" \
+            -batchmode -quit \
+            -projectPath "$(pwd)" \
+            -executeMethod KerbcastCI.CameraOrientation.RenderAll \
+            -buildTarget Linux64 \
+            -logFile -
+
       - uses: actions/upload-artifact@v4
         with:
           name: kerbcast-shaders-unix
