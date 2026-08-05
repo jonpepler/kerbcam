@@ -293,29 +293,12 @@ jobs:
           # install that passed). Fresh install costs ~10 min per run.
           cache-installation: false
 
-      # Activate against the editor directly, not via Hub's Licensing Client.
-      # 2019.4 predates that client — it uses the legacy flow, which the editor
-      # binary performs itself — and buildalon/activate-unity-license refuses to
-      # run without Hub installed ("Unity Hub is not installed or not
-      # accessible"). Since we no longer install Hub, do it the 2019 way.
       - name: Activate Unity Personal license
-        env:
-          UNITY_USERNAME: ${{ secrets.UNITY_USERNAME }}
-          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
-        run: |
-          set -eu
-          xvfb-run -a "$UNITY_EDITOR_PATH" \
-            -batchmode -nographics -quit -logFile /tmp/activate.log \
-            -username "$UNITY_USERNAME" -password "$UNITY_PASSWORD" || true
-          # The editor's exit code is unreliable here; the licence file is the
-          # real signal.
-          if ls ~/.local/share/unity3d/Unity/Unity_lic.ulf >/dev/null 2>&1; then
-            echo "licence activated"
-          else
-            echo "::error::Unity licence activation failed; see log below"
-            tail -40 /tmp/activate.log || true
-            exit 1
-          fi
+        uses: buildalon/activate-unity-license@v2
+        with:
+          license: 'Personal'
+          username: ${{ secrets.UNITY_USERNAME }}
+          password: ${{ secrets.UNITY_PASSWORD }}
 
 
       # Native Windows shader compiler: the whole point of this job. The
