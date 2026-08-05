@@ -418,8 +418,20 @@ mod imp {
                 // runtime value we used for the hwframe pool — avoids the same
                 // enum-alias mismatch that broke av_hwframe_ctx_init.
                 // encoder.set_format(Pixel::VAAPI) would write the wrong value.
+                /* VBR, not CBR, and the difference is load-bearing. Setting
+                max_bit_rate EQUAL to bit_rate makes ffmpeg select CBR for
+                h264_vaapi, and VAAPI's CBR keeps a strict HRD: it pads every
+                frame with filler NAL units up to bitrate/fps bytes, so every
+                frame is exactly the same size whatever is in it (measured on
+                the Deck: a dead-constant 33345 B/frame at 8 Mbit, and 6250
+                B/frame at the 1.5 Mbit default). A per-frame byte CEILING on
+                a detailed scene forces QP up until small inter-frame motion
+                quantises to zero, so the picture holds for several frames and
+                then snaps as the error crosses the threshold — the judder.
+                Giving max_bit_rate headroom selects VBR: frame size follows
+                content, no filler, and slow motion survives quantisation. */
                 encoder.set_bit_rate(cfg.bitrate_bps as usize);
-                encoder.set_max_bit_rate(cfg.bitrate_bps as usize);
+                encoder.set_max_bit_rate((cfg.bitrate_bps as usize).saturating_mul(2));
                 encoder.set_time_base((1, cfg.fps as i32));
                 encoder.set_frame_rate(Some((cfg.fps as i32, 1)));
                 // Keyframe roughly every 2 seconds — same default as
