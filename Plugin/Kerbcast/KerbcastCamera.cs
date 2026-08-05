@@ -547,10 +547,50 @@ namespace Kerbcast
             }
         }
 
+        /* Orientation proof marker: a four-quadrant pattern whose correct layout
+           is known (TOP-LEFT darkest .. BOTTOM-RIGHT brightest). Substituted for
+           the camera's image so it travels the ENTIRE shipped path — this
+           camera's real filter material, the real capture blit, the real
+           readback flip, the real ring write — and is then classified from the
+           ring, which IS the delivered output. Scene content cannot do this
+           job: a camera on open sky has no marker, and a dim limb gives no
+           measurable point source.
+
+           Quadrants differ in LUMINANCE, not hue, so they survive the
+           monochrome filters, and are judged by rank so filter gain is
+           irrelevant. One cached texture, one Blit, no per-frame allocation:
+           an earlier version took a full-size RenderTexture.GetTemporary per
+           camera per frame and took KSP down with it. */
+        private static Texture2D s_orientMarker;
+
+        private static Texture2D OrientationMarker()
+        {
+            if (s_orientMarker != null) return s_orientMarker;
+            const int size = 64;
+            // Texture2D rows run bottom-up: y >= size/2 is the TOP half.
+            var px = new Color32[size * size];
+            for (int y = 0; y < size; y++)
+                for (int x = 0; x < size; x++)
+                {
+                    bool top = y >= size / 2, left = x < size / 2;
+                    byte v = top ? (left ? (byte)40 : (byte)90)
+                                 : (left ? (byte)150 : (byte)230);
+                    px[y * size + x] = new Color32(v, v, v, 255);
+                }
+            s_orientMarker = new Texture2D(size, size, TextureFormat.RGBA32, false);
+            s_orientMarker.SetPixels32(px);
+            s_orientMarker.Apply(false, false);
+            return s_orientMarker;
+        }
+
         private void CaptureBlit(RenderTexture src, RenderTexture dst)
         {
             bool diag = KerbcastSettings.EnableBlitDiagnostics
                 && (++s_diagTick % DiagEveryFrames) == 0;
+            // Overwrite the just-rendered capture RT in place. One blit, no
+            // allocation; the camera has already rendered by the time we run.
+            if (KerbcastSettings.EnableOrientationTestPattern && src != null)
+                Graphics.Blit(OrientationMarker(), src);
             float srcMean = 0f, srcPeak = 0f;
             if (diag) srcMean = ProbeLuminance(src, out srcPeak);
             if (diag) LogExpectedSunViewport();

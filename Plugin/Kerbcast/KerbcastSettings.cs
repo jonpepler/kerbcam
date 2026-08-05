@@ -175,6 +175,13 @@ namespace Kerbcast
         // off by default.
         public static bool EnableBlitDiagnostics { get; private set; } = false;
 
+        /* Replace each camera's image with a known four-quadrant marker so the
+           SHIPPED chain (filter, capture blit, readback flip, ring write) can be
+           judged from the delivered frame: upright means TOP-LEFT darkest and
+           BOTTOM-RIGHT brightest. Diagnostic only — every feed becomes the test
+           pattern while this is on. */
+        public static bool EnableOrientationTestPattern { get; private set; } = false;
+
         // Run TUFX post-processing on each layered kerbcast camera when TUFX
         // is installed. Without it, atmospheric scattering on Kerbin's horizon
         // has too wide a dynamic range to display correctly even with
@@ -451,6 +458,7 @@ namespace Kerbcast
             ApplyString(node, "AtmosphericFxLayers", v => settings.AtmosphericFxLayers = ParseAtmoFxLayers(v));
             ApplyBool(node, "EnableHullcamEffects", v => EnableHullcamEffects = v);
             ApplyBool(node, "EnableBlitDiagnostics", v => EnableBlitDiagnostics = v);
+            ApplyBool(node, "EnableOrientationTestPattern", v => EnableOrientationTestPattern = v);
             ApplyBool(node, "EnableTUFX", v => EnableTUFX = v);
             ApplyBool(node, "EnableEVE", v => EnableEVE = v);
             ApplyBool(node, "EnableScatterer", v => EnableScatterer = v);

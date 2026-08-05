@@ -182,3 +182,34 @@ Checklist:
 pkill -f fake_camera; pkill -f kerbcast-sidecar
 rm -rf /tmp/kerbcast-test-rings
 ```
+
+## Orientation proof (flips)
+
+Settles "is this camera mirrored / upside down?" without eyeballing, per camera,
+through the REAL shipped chain — that camera's actual filter material, the
+capture blit, the readback flip, the ring write.
+
+1. `EnableOrientationTestPattern = true` in `GameData/Kerbcast/PluginData/settings.cfg`
+   (or the main `settings.cfg`), restart KSP, enter flight.
+   Every feed becomes a four-quadrant marker: TOP-LEFT darkest, BOTTOM-RIGHT
+   brightest. Quadrants differ in LUMINANCE so they survive the monochrome
+   filters, and are judged by rank so filter gain does not matter.
+2. `python3 live_tests/orientation-check.py $(pgrep -f '[k]erbcast-sidecar')`
+   on the Deck. It reads each ring — the delivered output, not a re-render —
+   and prints UPRIGHT / VERTICAL FLIP / HORIZONTAL MIRROR / ROTATED 180.
+3. Turn the setting back off.
+
+Two traps this design exists to avoid, both of which produced confident wrong
+answers first time:
+
+- **Read back the way production does.** The capture tail's flip exists solely
+  to cancel the inversion `AsyncGPUReadback` returns on bottom-left-origin APIs.
+  Measuring it with `ReadPixels` invents a vertical flip that is not in the
+  delivered frame — it will fail a correct pipeline and pass a broken one.
+  Reading the ring sidesteps this entirely, which is why the check works there.
+- **Do not allocate per frame.** An earlier version took a full-size
+  `RenderTexture.GetTemporary` per camera per frame and took KSP down. The
+  marker is one cached texture and one `Graphics.Blit` into the capture RT.
+
+Result 2026-08-05 (Deck, glcore, 5 cameras incl. 2 Hullcam-filtered): all
+UPRIGHT. The capture chain does not flip.
