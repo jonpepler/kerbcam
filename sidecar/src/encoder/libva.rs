@@ -451,6 +451,20 @@ mod imp {
                 // guard differences (confirmed by diagnostic 2026-05-24).
                 let ctx_mut = encoder.as_mut_ptr();
                 (*ctx_mut).pix_fmt = hw_pix_fmt;
+                /* Cap the quantiser. Rate control left to its own devices picks
+                a QP high enough that slow inter-frame motion quantises to
+                zero: every macroblock comes back "skip" and the encoder emits
+                a near-empty P-frame, so the picture holds for several frames
+                and then snaps when accumulated error finally survives the
+                quantiser. Measured on the Deck as a clean period-3 — two
+                ~180 B frames then one ~7 kB frame — against a ring whose
+                content was changing smoothly every frame (MAD sd 0.021).
+                This is not a bitrate shortage: at 1.5 Mbit the encoder was
+                spending ~400 kbit. Bounding qmax forces it to spend what it
+                has rather than throw the motion away; qmin keeps it from
+                wasting the whole budget on a static scene. */
+                (*ctx_mut).qmin = 10;
+                (*ctx_mut).qmax = 26;
                 let frames_bref = ffmpeg::ffi::av_buffer_ref(self.hw_frames_ref);
                 if frames_bref.is_null() {
                     self.close();
