@@ -535,27 +535,99 @@ jobs:
           cp ci/hullcam-shaders/BuildShaderBundle.cs \
              hullcam/HullCameraAssets/Assets/Editor/BuildShaderBundle.cs
 
-      # Unity Hub's postinst calls update-desktop-database, which is absent on
-      # the runner image. The script fails, the package never finishes
-      # configuring, and /opt/unityhub/unityhub is never created — so
-      # buildalon/unity-setup dies with ENOENT before Unity starts. This took
-      # out the shader workflow from 2026-07-23 and then the v1.9.0 release.
-      # Supplying the tool lets the postinst complete.
-      - name: Install a Unity Hub version the setup action can find
-        # Linux only: apt does not exist on the Windows runner.
-        #
-        # Hub 3.20 moved its binary to /usr/lib/unityhub/unityhub, while
-        # buildalon/unity-setup requires an install at /opt/unityhub/unityhub —
-        # and symlinking the expected path is not enough, the action's own
-        # is-installed check still rejects it. So pin the newest pre-3.20 Hub,
-        # which installs where the action expects. Its postinst also calls
-        # update-desktop-database, absent on the runner, so install that first
-        # or the package never finishes configuring.
-        #
-        # This is why the shader workflow had no green run after 2026-07-23 and
-        # why the v1.9.0 GameData bundle failed: the runner silently moved to
-        # 3.20. Print the candidates so the next drift is visible, not silent.
-        if: runner.os == 'Linux'
+      # No Unity Hub on Linux. Hub is an Electron desktop app; driving it
+      # headlessly on a runner is what broke here — the runner image moved to
+      # Hub 3.20, which relocated its binary out of /opt/unityhub, and
+      # buildalon/unity-setup still probes the old path (upstream
+      # buildalon/unity-setup#57; the fix, RageAgainstThePixel/unity-cli#81, is
+      # open and unreleased). Even with a pinned pre-3.20 Hub the headless
+      # install returned in 3 seconds having installed nothing.
+      #
+      # We already pin the exact version AND changeset, and Unity publishes both
+      # as plain tarballs, so fetch them directly: deterministic, cacheable, and
+      # immune to Hub/runner drift. Only the licence still has to reach Unity.
+      - name: Resolve Unity version + changeset
+        id: unity
+        run: |
+          set -eu
+          FULL="${{ env.UNITY_VERSION }}"          # e.g. "2019.4.40f1 (ffc62b691db5)"
+          VER="${FULL%% *}"
+          CS="$(printf '%s' "$FULL" | sed -E 's/.*\(([0-9a-f]+)\).*/\1/')"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "changeset=$CS" >> "$GITHUB_OUTPUT"
+          echo "resolved Unity $VER changeset $CS"
+
+      - name: Restore cached Unity Editor
+        id: unity-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/unity-editor
+          key: unity-linux-${{ steps.unity.outputs.version }}-${{ steps.unity.outputs.changeset }}-mac-mono-v1
+
+      - name: Download Unity Editor + Mac support (cache miss only)
+        if: steps.unity-cache.outputs.cache-hit != 'true'
+        env:
+          VER: ${{ steps.unity.outputs.version }}
+          CS: ${{ steps.unity.outputs.changeset }}
+        run: |
+          set -eux
+          sudo apt-get update -qq
+          sudo apt-get install -y libarchive-tools cpio
+          BASE="https://download.unity3d.com/download_unity/${CS}"
+          mkdir -p ~/unity-editor
+          # The editor itself ships as a plain Linux tarball.
+          curl -fsSL --retry 3 --retry-delay 5 \
+            "${BASE}/LinuxEditorInstaller/Unity.tar.xz" -o /tmp/unity.tar.xz
+          tar -xf /tmp/unity.tar.xz -C ~/unity-editor
+          rm -f /tmp/unity.tar.xz
+          # Mac mono support lets this Linux editor compile the metal variants
+          # for the macOS bundle. Unity publishes NO Linux-hosted build of that
+          # module for 2019.4 — verified, LinuxEditorTargetInstaller 404s and
+          # only the macOS .pkg exists — so unpack the .pkg by hand. It is a xar
+          # archive whose Payload is a gzipped cpio of the playback engine's
+          # CONTENTS; PackageInfo gives install-location
+          # /Applications/Unity/PlaybackEngines/MacStandaloneSupport, which on a
+          # Linux editor is Editor/Data/PlaybackEngines/MacStandaloneSupport.
+          curl -fsSL --retry 3 --retry-delay 5 \
+            "${BASE}/MacEditorTargetInstaller/UnitySetup-Mac-Mono-Support-for-Editor-${VER}.pkg" \
+            -o /tmp/mac-mono.pkg
+          rm -rf /tmp/macx && mkdir -p /tmp/macx
+          ( cd /tmp/macx && bsdtar -xf /tmp/mac-mono.pkg TargetSupport.pkg.tmp/Payload )
+          DEST=~/unity-editor/Editor/Data/PlaybackEngines/MacStandaloneSupport
+          mkdir -p "$DEST"
+          gunzip -dc /tmp/macx/TargetSupport.pkg.tmp/Payload | ( cd "$DEST" && cpio -idmu --quiet )
+          rm -rf /tmp/macx /tmp/mac-mono.pkg
+          test -f "$DEST/modules.asset"
+          echo "mac-mono module installed:"; ls "$DEST" | head -5
+
+      - name: Locate the editor binary
+        run: |
+          set -eu
+          EDITOR="$(find ~/unity-editor -maxdepth 3 -type f -name Unity -perm -u+x | head -1)"
+          test -n "$EDITOR"
+          echo "UNITY_EDITOR_PATH=$EDITOR" >> "$GITHUB_ENV"
+          echo "editor: $EDITOR"
+          "$EDITOR" -version 2>/dev/null || true
+
+      # Unity refuses to run headless without the graphics/audio libs the
+      # Hub install would have pulled in as dependencies.
+      - name: Install Unity runtime libraries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            libgtk-3-0 libnss3 libasound2 libgconf-2-4 libxtst6 libxss1 \
+            libgbm1 libnotify4 xvfb desktop-file-utils || true
+
+      # Hub is installed ONLY so the licensing client exists: Unity's Personal
+      # activation goes through it, and buildalon/activate-unity-license refuses
+      # to run without it. The EDITOR still comes from the direct download above
+      # — Hub's headless editor install is the part that is broken (it returns in
+      # 3 seconds having installed nothing), and we no longer rely on it.
+      #
+      # Pin pre-3.20: 3.20 relocated its binary to /usr/lib/unityhub while the
+      # tooling expects /opt/unityhub (buildalon/unity-setup#57; the fix,
+      # RageAgainstThePixel/unity-cli#81, is open and unreleased).
+      - name: Install Unity Hub (licensing client only)
         run: |
           set -eux
           sudo apt-get update -qq
@@ -565,44 +637,19 @@ jobs:
             | sudo tee /usr/share/keyrings/Unity_Technologies_ApS.gpg >/dev/null
           sudo sh -c 'echo "deb [signed-by=/usr/share/keyrings/Unity_Technologies_ApS.gpg] https://hub.unity3d.com/linux/repos/deb stable main" > /etc/apt/sources.list.d/unityhub.list'
           sudo apt-get update -qq
-          echo "=== available unityhub versions ==="
-          apt-cache madison unityhub || true
           VER="$(apt-cache madison unityhub | awk '{print $3}' | grep -v '^3\.20' | head -1)"
-          echo "pinning unityhub ${VER:-<none found, using latest>}"
+          echo "pinning unityhub ${VER:-<latest>}"
           if [ -n "$VER" ]; then
-            # An apt PIN, not apt-mark hold: the setup action runs its own
-            # `apt-get install unityhub`, and a hold makes that fail with
-            # exit 100. A pin keeps the version fixed while letting the
-            # action's install succeed against it.
             printf 'Package: unityhub\nPin: version %s\nPin-Priority: 1001\n' "$VER" \
               | sudo tee /etc/apt/preferences.d/unityhub >/dev/null
             sudo apt-get install -y "unityhub=$VER"
           else
             sudo apt-get install -y unityhub
           fi
-          ls -la /opt/unityhub || true
-          # The action spawns a binary called `unity-hub` (hyphenated); the
-          # package provides `unityhub`. Without this alias it fails with
-          # "spawn unity-hub ENOENT" even though Hub is correctly installed.
           if [ -x /opt/unityhub/unityhub ] && [ ! -e /usr/bin/unity-hub ]; then
             sudo ln -sf /opt/unityhub/unityhub /usr/bin/unity-hub
           fi
           command -v unity-hub unityhub || true
-
-      - name: Set up Unity Hub + Editor
-        uses: buildalon/unity-setup@v2
-        with:
-          unity-version: ${{ env.UNITY_VERSION }}
-          version-file: "None"
-          # macOS player-support is for the kerbcast-shaders.osx bundle; the
-          # HullcamVDS shaders.linux build stays Linux-only. The cross-target
-          # must be requested as a Hub module id via `modules` because the
-          # action rejects non-host build-targets on Linux. The Windows bundle comes
-          # from the build-windows-shaders job (native toolchain), not from a
-          # windows-mono cross-compile here.
-          build-targets: StandaloneLinux64
-          modules: mac-mono
-          cache-installation: true
 
       - name: Activate Unity Personal license
         uses: buildalon/activate-unity-license@v2
