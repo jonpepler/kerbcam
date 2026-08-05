@@ -138,20 +138,11 @@ namespace Kerbcast
             long blitStart = _telemetry ? Stopwatch.GetTimestamp() : 0;
             blit(_captureRt, _readbackRt);
 
-            // Vertical-flip correction. On bottom-left-origin graphics APIs
-            // (OpenGL, the Deck) AsyncGPUReadback returns the frame vertically
-            // inverted relative to KSP's top-down screen pipeline, so every
-            // camera reads back upside down. Compensate with one final blit that
-            // mirrors V. Top-left-origin APIs (D3D11, Metal) read upright and need
-            // no correction here; the HullcamFilterBlit handles its own top-left
-            // flip case. Done in place via a temp RT so all capture paths benefit.
-            if (!SystemInfo.graphicsUVStartsAtTop)
-            {
-                var flipTmp = RenderTexture.GetTemporary(_readbackRt.descriptor);
-                Graphics.Blit(_readbackRt, flipTmp, new Vector2(1f, -1f), new Vector2(0f, 1f));
-                Graphics.Blit(flipTmp, _readbackRt);
-                RenderTexture.ReleaseTemporary(flipTmp);
-            }
+            // Vertical-flip correction, in CaptureOrientation so the headless
+            // orientation proof compiles the same source. Behaviour unchanged:
+            // bottom-left-origin APIs (OpenGL, the Deck) read back inverted and
+            // get one mirroring blit; top-left-origin APIs are a no-op here.
+            CaptureOrientation.ApplyReadbackFlip(_readbackRt);
             if (_telemetry)
                 _phaseTimings.Record(RenderPhase.Blit,
                     (Stopwatch.GetTimestamp() - blitStart) * _msPerTick);
