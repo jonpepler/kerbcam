@@ -421,6 +421,7 @@ namespace Kerbcast
                     return;
                 }
                 _cameraFilter = filter;
+                _filterModeName = mode.ToString();
                 if (_hullcamTitleTex == null)
                 {
                     _hullcamTitleTex = CameraFilter.LoadTextureFile("dockingdisplay.png");
@@ -460,8 +461,56 @@ namespace Kerbcast
         // own shader pass that post-processes src -> dst in one step; the
         // AsyncGPUReadback path then reads the already-filtered pixels, no extra
         // round-trip needed.
+        /* DIAGNOSTIC (black-frames hunt, 2026-08-05). Samples the RT into a tiny
+           readback so we can see luminance immediately BEFORE and AFTER the filter
+           pass. That is the one measurement that separates "the filter received a
+           black frame" from "the filter produced one" — everything else has been
+           inference from the far end of the pipeline. Throttled to one probe every
+           N frames; ~0 cost between probes. */
+        private string _filterModeName;
+        private static int s_diagTick;
+        private const int DiagEveryFrames = 150;
+
+        private static float ProbeLuminance(RenderTexture rt, out float peak)
+        {
+            peak = 0f;
+            if (rt == null) return -1f;
+            const int n = 8;
+            RenderTexture tmp = null; Texture2D tex = null;
+            var prev = RenderTexture.active;
+            try
+            {
+                tmp = RenderTexture.GetTemporary(n, n, 0, RenderTextureFormat.ARGB32);
+                Graphics.Blit(rt, tmp);
+                RenderTexture.active = tmp;
+                tex = new Texture2D(n, n, TextureFormat.RGBA32, false);
+                tex.ReadPixels(new Rect(0, 0, n, n), 0, 0, false);
+                tex.Apply(false, false);
+                var px = tex.GetPixels32();
+                float sum = 0f;
+                for (int i = 0; i < px.Length; i++)
+                {
+                    float m = Mathf.Max(px[i].r, Mathf.Max(px[i].g, px[i].b));
+                    sum += m; if (m > peak) peak = m;
+                }
+                return sum / px.Length;
+            }
+            catch (Exception) { return -1f; }
+            finally
+            {
+                RenderTexture.active = prev;
+                if (tex != null) UnityEngine.Object.Destroy(tex);
+                if (tmp != null) RenderTexture.ReleaseTemporary(tmp);
+            }
+        }
+
         private void CaptureBlit(RenderTexture src, RenderTexture dst)
         {
+            bool diag = KerbcastSettings.EnableBlitDiagnostics
+                && (++s_diagTick % DiagEveryFrames) == 0;
+            float srcMean = 0f, srcPeak = 0f;
+            if (diag) srcMean = ProbeLuminance(src, out srcPeak);
+
             if (_nvMaterial != null)
             {
                 Graphics.Blit(src, dst, _nvMaterial);
@@ -493,6 +542,18 @@ namespace Kerbcast
             else
             {
                 Graphics.Blit(src, dst);
+            }
+
+            if (diag)
+            {
+                float dstPeak; float dstMean = ProbeLuminance(dst, out dstPeak);
+                string path = _nvMaterial != null ? "nightvision-material"
+                    : _cameraFilter != null ? "hullcam-filter" : "plain-blit";
+                UnityEngine.Debug.Log(
+                    $"[Kerbcast][BLITDIAG] cam={FlightId} path={path} mode={_filterModeName ?? "none"} "
+                    + $"src={src?.width}x{src?.height}/{src?.format} dst={dst?.width}x{dst?.height}/{dst?.format} "
+                    + $"SRC mean={srcMean:F1} peak={srcPeak:F0} -> DST mean={dstMean:F1} peak={dstPeak:F0}"
+                    + (srcPeak > 8f && dstPeak <= 8f ? "  <<< FILTER BLACKENED A NON-BLACK FRAME" : ""));
             }
         }
 
