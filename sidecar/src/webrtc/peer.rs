@@ -17,8 +17,9 @@
 //! state via its periodic `*.control.json` poll, so layer/render-size
 //! changes propagate within ~1s of the data-channel write.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
+use std::time::Duration;
 
 /// Monotonic counter for per-peer identifiers. Identifies a peer for
 /// logging and slot bookkeeping (SetDegrade arrives via the data
@@ -27,6 +28,8 @@ static NEXT_PEER_ID: AtomicU32 = AtomicU32::new(1);
 
 use anyhow::{anyhow, Result};
 use tokio::sync::{Mutex, Notify};
+/* tokio's clock, not std's, so tests can freeze and advance it. */
+use tokio::time::Instant;
 use tracing::{info, warn};
 
 use webrtc::api::interceptor_registry::register_default_interceptors;
@@ -71,6 +74,119 @@ struct Slot {
     bound: Option<u32>,
 }
 
+/// How long a peer may sit in `Disconnected` before the reaper takes it.
+/// `Disconnected` is recoverable: webrtc-ice raises it after 5s of silence and
+/// only escalates to `Failed` 25s later (its `disconnected_timeout` +
+/// `failed_timeout`), while a real network blip heals in well under a second.
+/// `Failed` is the authority on a dead connection, so this window sits just
+/// past the point where the agent would have delivered that verdict: it is the
+/// backstop for a peer that never gets one, not the primary teardown path.
+const DISCONNECTED_GRACE: Duration = Duration::from_secs(30);
+
+/// How long a freshly built peer has to reach `Connected`. Same shape as the
+/// grace window: webrtc-ice fails a never-connected agent after ~30s of
+/// checks, so `Failed` still decides a negotiation that actually ran. This
+/// covers the peer whose checks never started, e.g. a client that hangs up
+/// mid-`/offer` leaves the agent with no local description, so it sits in
+/// `New` forever holding its initial cameras subscribed.
+const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Liveness {
+    /// Built, never yet connected. Bounded by `NEGOTIATION_TIMEOUT`.
+    Negotiating,
+    Connected,
+    /// Was connected, ICE dropped out. Recoverable, bounded by
+    /// `DISCONNECTED_GRACE`.
+    Disconnected {
+        since: Instant,
+    },
+    /// Terminal: `Failed`, `Closed`, or a signalling exchange that failed.
+    Dead,
+}
+
+/// Peer liveness as the reaper sees it. A plain state machine over
+/// `RTCPeerConnectionState` plus two deadlines, kept free of any webrtc
+/// plumbing so the timeout rules are testable without a browser.
+struct PeerLiveness {
+    state: Liveness,
+    created_at: Instant,
+}
+
+impl PeerLiveness {
+    fn new(now: Instant) -> Self {
+        Self {
+            state: Liveness::Negotiating,
+            created_at: now,
+        }
+    }
+
+    fn observe(&mut self, state: RTCPeerConnectionState, now: Instant) {
+        /* Dead is sticky: the reaper may already have closed this peer, and a
+        late callback must not resurrect one whose cameras are released. */
+        if self.state == Liveness::Dead {
+            return;
+        }
+        match state {
+            RTCPeerConnectionState::Connected => self.state = Liveness::Connected,
+            /* Only the first Disconnected records a timestamp: repeat
+            notifications must not keep pushing the deadline out. */
+            RTCPeerConnectionState::Disconnected
+                if !matches!(self.state, Liveness::Disconnected { .. }) =>
+            {
+                self.state = Liveness::Disconnected { since: now }
+            }
+            RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed => {
+                self.state = Liveness::Dead
+            }
+            _ => {}
+        }
+    }
+
+    fn is_alive(&self, now: Instant) -> bool {
+        match self.state {
+            Liveness::Dead => false,
+            Liveness::Connected => true,
+            Liveness::Negotiating => {
+                now.saturating_duration_since(self.created_at) < NEGOTIATION_TIMEOUT
+            }
+            Liveness::Disconnected { since } => {
+                now.saturating_duration_since(since) < DISCONNECTED_GRACE
+            }
+        }
+    }
+}
+
+/// Shared handle on a peer's `PeerLiveness`: the connection-state callback
+/// writes it, the reaper reads it. Lock poisoning is shrugged off because the
+/// guarded value is two `Copy` fields that no panic can leave half-written.
+#[derive(Clone)]
+struct LivenessHandle(Arc<StdMutex<PeerLiveness>>);
+
+impl LivenessHandle {
+    fn new(now: Instant) -> Self {
+        Self(Arc::new(StdMutex::new(PeerLiveness::new(now))))
+    }
+
+    fn guard(&self) -> MutexGuard<'_, PeerLiveness> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn observe(&self, state: RTCPeerConnectionState, now: Instant) {
+        self.guard().observe(state, now);
+    }
+
+    fn kill(&self) {
+        self.guard().state = Liveness::Dead;
+    }
+
+    fn is_alive(&self, now: Instant) -> bool {
+        self.guard().is_alive(now)
+    }
+}
+
 pub struct KerbcastPeer {
     pc: Arc<RTCPeerConnection>,
     /// Stable identifier for this peer for the lifetime of the
@@ -90,9 +206,10 @@ pub struct KerbcastPeer {
     /// peer directly without re-discovering the channel each time.
     control_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
     connected: Arc<Notify>,
-    /// Flipped to `false` when the underlying RTCPeerConnection reaches a
-    /// terminal state. The daemon polls `is_alive()` each consume tick.
-    alive: Arc<AtomicBool>,
+    /// Connection liveness, fed by the RTCPeerConnection state callback. The
+    /// daemon polls `is_alive()` each consume tick and reaps what it reports
+    /// dead.
+    liveness: LivenessHandle,
 }
 
 impl KerbcastPeer {
@@ -254,22 +371,15 @@ impl KerbcastPeer {
         }));
 
         let connected = Arc::new(Notify::new());
-        let alive = Arc::new(AtomicBool::new(true));
+        let liveness = LivenessHandle::new(Instant::now());
         let connected_for_handler = connected.clone();
-        let alive_for_handler = alive.clone();
+        let liveness_for_handler = liveness.clone();
         pc.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
             info!(?state, "peer connection state");
             if state == RTCPeerConnectionState::Connected {
                 connected_for_handler.notify_waiters();
             }
-            if matches!(
-                state,
-                RTCPeerConnectionState::Disconnected
-                    | RTCPeerConnectionState::Failed
-                    | RTCPeerConnectionState::Closed
-            ) {
-                alive_for_handler.store(false, Ordering::Release);
-            }
+            liveness_for_handler.observe(state, Instant::now());
             Box::pin(async {})
         }));
 
@@ -280,7 +390,7 @@ impl KerbcastPeer {
             subscribed,
             control_channel,
             connected,
-            alive,
+            liveness,
         })
     }
 
@@ -368,8 +478,21 @@ impl KerbcastPeer {
         Ok(local.sdp)
     }
 
+    /// False once the connection is terminal (`Failed`/`Closed`), or once it
+    /// has overstayed one of the two deadlines: `DISCONNECTED_GRACE` for a
+    /// connection that dropped out, `NEGOTIATION_TIMEOUT` for one that never
+    /// connected at all. A transient `Disconnected` stays alive, so a network
+    /// blip no longer tears the viewer's feed down.
     pub fn is_alive(&self) -> bool {
-        self.alive.load(Ordering::Acquire)
+        self.liveness.is_alive(Instant::now())
+    }
+
+    /// Mark the peer terminal without waiting for a deadline. Used by the
+    /// signalling handler when the SDP exchange fails: the connection can
+    /// never come up, so the reaper should collect it on its next tick rather
+    /// than hold its cameras subscribed for the whole negotiation window.
+    pub fn mark_dead(&self) {
+        self.liveness.kill();
     }
 
     /// Flight IDs currently bound to this peer's slots. Unlike the
@@ -1493,6 +1616,7 @@ async fn drain_rtcp_sink(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::sync::Weak;
     use std::time::Duration;
 
@@ -1740,5 +1864,148 @@ mod tests {
         let t0 = std::time::Instant::now();
         let now = t0 + Duration::from_millis(200);
         assert!(should_force_keyframe(9, Some((7, t0)), now, GAP));
+    }
+
+    /// The regression this state machine exists for: `Disconnected` used to be
+    /// treated as terminal, so the reaper closed the peer and the viewer lost
+    /// the feed for a blip WebRTC would have healed on its own. ICE raises
+    /// `Disconnected` after 5s of silence; recovery from there is routine.
+    #[test]
+    fn a_transient_disconnect_keeps_the_peer_alive() {
+        let t0 = Instant::now();
+        let mut live = PeerLiveness::new(t0);
+        live.observe(RTCPeerConnectionState::Connected, t0);
+        live.observe(RTCPeerConnectionState::Disconnected, t0);
+
+        assert!(
+            live.is_alive(t0 + DISCONNECTED_GRACE - Duration::from_secs(1)),
+            "a peer inside the grace window must not be reaped"
+        );
+    }
+
+    #[test]
+    fn recovery_from_disconnected_clears_the_grace_window() {
+        let t0 = Instant::now();
+        let mut live = PeerLiveness::new(t0);
+        live.observe(RTCPeerConnectionState::Connected, t0);
+        live.observe(RTCPeerConnectionState::Disconnected, t0);
+        live.observe(
+            RTCPeerConnectionState::Connected,
+            t0 + Duration::from_secs(2),
+        );
+
+        assert!(
+            live.is_alive(t0 + DISCONNECTED_GRACE * 10),
+            "a recovered peer is alive indefinitely, the earlier drop is spent"
+        );
+    }
+
+    #[test]
+    fn a_disconnect_that_never_recovers_is_reaped_after_the_grace() {
+        let t0 = Instant::now();
+        let mut live = PeerLiveness::new(t0);
+        live.observe(RTCPeerConnectionState::Connected, t0);
+        live.observe(RTCPeerConnectionState::Disconnected, t0);
+
+        assert!(!live.is_alive(t0 + DISCONNECTED_GRACE + Duration::from_secs(1)));
+    }
+
+    /// The grace window is measured from the FIRST `Disconnected`. webrtc-rs
+    /// can re-raise the same state, and restarting the clock on each one would
+    /// let a peer that never recovers hold its cameras forever.
+    #[test]
+    fn repeat_disconnected_notifications_do_not_extend_the_grace() {
+        let t0 = Instant::now();
+        let mut live = PeerLiveness::new(t0);
+        live.observe(RTCPeerConnectionState::Connected, t0);
+        live.observe(RTCPeerConnectionState::Disconnected, t0);
+        live.observe(
+            RTCPeerConnectionState::Disconnected,
+            t0 + DISCONNECTED_GRACE - Duration::from_secs(1),
+        );
+
+        assert!(!live.is_alive(t0 + DISCONNECTED_GRACE + Duration::from_secs(1)));
+    }
+
+    /// `Failed` and `Closed` are the terminal states, and unlike `Disconnected`
+    /// they get no grace at all: the connection is gone, so its cameras must
+    /// stop rendering on the next reaper tick.
+    #[test]
+    fn failed_and_closed_are_terminal_immediately() {
+        let t0 = Instant::now();
+        for terminal in [
+            RTCPeerConnectionState::Failed,
+            RTCPeerConnectionState::Closed,
+        ] {
+            let mut live = PeerLiveness::new(t0);
+            live.observe(RTCPeerConnectionState::Connected, t0);
+            live.observe(terminal, t0);
+            assert!(!live.is_alive(t0), "{terminal} must be terminal at once");
+        }
+    }
+
+    /// Once the reaper has a dead verdict it closes the peer and releases its
+    /// cameras. A late callback must not undo that: the peer it would revive
+    /// no longer owns anything.
+    #[test]
+    fn dead_is_sticky() {
+        let t0 = Instant::now();
+        let mut live = PeerLiveness::new(t0);
+        live.observe(RTCPeerConnectionState::Failed, t0);
+        live.observe(
+            RTCPeerConnectionState::Connected,
+            t0 + Duration::from_secs(1),
+        );
+
+        assert!(!live.is_alive(t0 + Duration::from_secs(1)));
+    }
+
+    /// Bug 2's reaper half: a peer that never reaches `Connected` (client
+    /// vanished mid-negotiation, so ICE never even started its checks) is
+    /// collectable on a deadline rather than living for the process lifetime.
+    #[test]
+    fn a_peer_that_never_connects_expires() {
+        let t0 = Instant::now();
+        let live = PeerLiveness::new(t0);
+
+        assert!(
+            live.is_alive(t0 + NEGOTIATION_TIMEOUT - Duration::from_secs(1)),
+            "negotiation must be given its full window"
+        );
+        assert!(!live.is_alive(t0 + NEGOTIATION_TIMEOUT + Duration::from_secs(1)));
+    }
+
+    /// The same deadline, through the real peer: proves `is_alive()` is wired
+    /// to the state machine's clock and not to a construction-time flag.
+    #[tokio::test]
+    async fn a_real_peer_that_never_connects_stops_reporting_alive() {
+        let registry = Arc::new(CameraRegistry::new(PathBuf::from("/tmp")));
+        let peer = KerbcastPeer::new(registry, &[], 0)
+            .await
+            .expect("build peer");
+        assert!(peer.is_alive(), "a fresh peer is alive while it negotiates");
+
+        tokio::time::pause();
+        tokio::time::advance(NEGOTIATION_TIMEOUT + Duration::from_secs(1)).await;
+
+        assert!(
+            !peer.is_alive(),
+            "a peer that never connected must become reapable"
+        );
+    }
+
+    /// A failed SDP exchange can never come up, so the signalling handler
+    /// retires it immediately instead of leaving its cameras subscribed for
+    /// the whole negotiation window.
+    #[tokio::test]
+    async fn mark_dead_retires_a_peer_without_waiting_for_the_deadline() {
+        let registry = Arc::new(CameraRegistry::new(PathBuf::from("/tmp")));
+        let peer = KerbcastPeer::new(registry, &[], 0)
+            .await
+            .expect("build peer");
+
+        peer.mark_dead();
+
+        assert!(!peer.is_alive());
     }
 }
