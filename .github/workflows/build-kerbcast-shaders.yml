@@ -101,21 +101,34 @@ jobs:
           CS: ${{ steps.unity.outputs.changeset }}
         run: |
           set -eux
+          sudo apt-get update -qq
+          sudo apt-get install -y libarchive-tools cpio
           BASE="https://download.unity3d.com/download_unity/${CS}"
           mkdir -p ~/unity-editor
-          # Editor itself.
+          # The editor itself ships as a plain Linux tarball.
           curl -fsSL --retry 3 --retry-delay 5 \
             "${BASE}/LinuxEditorInstaller/Unity.tar.xz" -o /tmp/unity.tar.xz
           tar -xf /tmp/unity.tar.xz -C ~/unity-editor
           rm -f /tmp/unity.tar.xz
-          # Mac mono support, so the Linux editor can compile the metal variants
-          # for the macOS bundle. Target installers are per-HOST, so this is the
-          # Linux-hosted flavour, not the .pkg a Mac would use.
+          # Mac mono support lets this Linux editor compile the metal variants
+          # for the macOS bundle. Unity publishes NO Linux-hosted build of that
+          # module for 2019.4 — verified, LinuxEditorTargetInstaller 404s and
+          # only the macOS .pkg exists — so unpack the .pkg by hand. It is a xar
+          # archive whose Payload is a gzipped cpio of the playback engine's
+          # CONTENTS; PackageInfo gives install-location
+          # /Applications/Unity/PlaybackEngines/MacStandaloneSupport, which on a
+          # Linux editor is Editor/Data/PlaybackEngines/MacStandaloneSupport.
           curl -fsSL --retry 3 --retry-delay 5 \
-            "${BASE}/LinuxEditorTargetInstaller/UnitySetup-Mac-Mono-Support-for-Editor-${VER}.tar.xz" \
-            -o /tmp/mac-mono.tar.xz
-          tar -xf /tmp/mac-mono.tar.xz -C ~/unity-editor
-          rm -f /tmp/mac-mono.tar.xz
+            "${BASE}/MacEditorTargetInstaller/UnitySetup-Mac-Mono-Support-for-Editor-${VER}.pkg" \
+            -o /tmp/mac-mono.pkg
+          rm -rf /tmp/macx && mkdir -p /tmp/macx
+          ( cd /tmp/macx && bsdtar -xf /tmp/mac-mono.pkg TargetSupport.pkg.tmp/Payload )
+          DEST=~/unity-editor/Editor/Data/PlaybackEngines/MacStandaloneSupport
+          mkdir -p "$DEST"
+          gunzip -dc /tmp/macx/TargetSupport.pkg.tmp/Payload | ( cd "$DEST" && cpio -idmu --quiet )
+          rm -rf /tmp/macx /tmp/mac-mono.pkg
+          test -f "$DEST/modules.asset"
+          echo "mac-mono module installed:"; ls "$DEST" | head -5
 
       - name: Locate the editor binary
         run: |
