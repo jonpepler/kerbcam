@@ -26,13 +26,14 @@
 
 use std::sync::Arc;
 
+use anyhow::anyhow;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{oneshot, RwLock};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, warn};
 
@@ -214,7 +215,27 @@ async fn offer(State(state): State<AppState>, Json(req): Json<OfferRequest>) -> 
     }
 }
 
+/// Runs the whole exchange on a spawned task rather than inline.
+///
+/// Axum drops a handler's future the moment the client hangs up, and every
+/// step below binds resources: `KerbcastPeer::new` subscribes the initial
+/// cameras (which wakes the plugin's per-camera render), and `answer_to_offer`
+/// then awaits ICE gathering. Dropped inline, that leaves cameras rendering
+/// with no peer in the list for the reaper to find, for the life of the
+/// process. The task cannot be cancelled, so the peer always reaches the peer
+/// list and the reaper always gets its chance at it.
 async fn handle_offer(state: AppState, req: OfferRequest) -> anyhow::Result<AnswerResponse> {
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let _ = tx.send(negotiate(state, req).await);
+    });
+    match rx.await {
+        Ok(result) => result,
+        Err(_) => Err(anyhow!("offer task died before answering")),
+    }
+}
+
+async fn negotiate(state: AppState, req: OfferRequest) -> anyhow::Result<AnswerResponse> {
     // Resolve selection: if the browser didn't ask for specific cameras,
     // subscribe to all of them. Useful for the v0.2 test page which
     // populates the picker from /cameras but lets the user click
@@ -239,14 +260,29 @@ async fn handle_offer(state: AppState, req: OfferRequest) -> anyhow::Result<Answ
     let slot_count = req.slots.map(|s| s as usize).unwrap_or(requested.len());
 
     let peer = Arc::new(KerbcastPeer::new(state.registry.clone(), &requested, slot_count).await?);
-    let answer_sdp = peer.answer_to_offer(req.sdp).await?;
-    let subscribed = peer.subscribed.clone();
 
+    /* Register BEFORE the SDP exchange, not after it succeeds. The peer holds
+    camera subscriptions from construction, and the peer list is the only thing
+    that makes it reachable: a peer registered on the success path alone is
+    invisible to the reaper on every other path, so a negotiation that never
+    completes pins its cameras subscribed forever. Registered here it is always
+    collectable, by its own connection state or by the negotiation deadline. */
     let peer_count = {
         let mut peers = state.peers.write().await;
-        peers.push(peer);
+        peers.push(peer.clone());
         peers.len()
     };
+
+    let answer_sdp = match peer.answer_to_offer(req.sdp).await {
+        Ok(sdp) => sdp,
+        Err(e) => {
+            /* This connection can never come up, so don't make its cameras wait
+            out the negotiation deadline. */
+            peer.mark_dead();
+            return Err(e);
+        }
+    };
+    let subscribed = peer.subscribed.clone();
     info!(
         peer_count,
         cameras = ?subscribed,
@@ -343,6 +379,72 @@ mod tests {
             body.len() < 500_000,
             "index.html grew to {} bytes -- did Mediabunny get inlined?",
             body.len(),
+        );
+    }
+
+    fn offer_that_cannot_be_answered() -> OfferRequest {
+        OfferRequest {
+            sdp: "not an sdp".to_owned(),
+            cameras: Vec::new(),
+            slots: Some(1),
+        }
+    }
+
+    /// A peer holds camera subscriptions from the moment it is built, so it
+    /// must be in the peer list before anything that can fail. Registering it
+    /// only on the success path left a failed exchange holding its cameras
+    /// with nothing able to see it.
+    #[tokio::test]
+    async fn a_failed_exchange_leaves_its_peer_registered_and_reapable() {
+        let state = empty_state();
+
+        let result = handle_offer(state.clone(), offer_that_cannot_be_answered()).await;
+
+        assert!(result.is_err(), "an unparseable offer must not answer");
+        let peers = state.peers.read().await;
+        assert_eq!(peers.len(), 1, "the peer must still be registered");
+        assert!(
+            !peers[0].is_alive(),
+            "a peer whose exchange failed must be reapable at once, not after \
+             the negotiation deadline"
+        );
+    }
+
+    /// The orphan the reaper could never collect: axum drops the handler future
+    /// when the client hangs up mid-request, and the peer built before that
+    /// point kept its cameras subscribed for the life of the process. The work
+    /// runs on its own task now, so cancelling the request cannot strand it.
+    #[tokio::test]
+    async fn a_cancelled_request_still_registers_its_peer() {
+        use std::future::Future;
+        use std::pin::pin;
+        use std::task::{Context, Poll, Waker};
+
+        let state = empty_state();
+
+        // Poll once (far enough to spawn the work), then drop: a client that
+        // hung up before the answer came back.
+        {
+            let mut request = pin!(handle_offer(state.clone(), offer_that_cannot_be_answered()));
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(
+                matches!(request.as_mut().poll(&mut cx), Poll::Pending),
+                "the request must still be in flight when it is dropped"
+            );
+        }
+
+        let mut registered = false;
+        for _ in 0..200 {
+            if state.peers.read().await.len() == 1 {
+                registered = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            registered,
+            "a cancelled request must still leave its peer in the list, or its \
+             cameras stay subscribed with nothing able to reap them"
         );
     }
 }
