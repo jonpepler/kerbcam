@@ -465,6 +465,20 @@ mod imp {
                 wasting the whole budget on a static scene. */
                 (*ctx_mut).qmin = 10;
                 (*ctx_mut).qmax = 26;
+                /* No B-frames. This one is the judder. B-frames are REORDERED:
+                they are transmitted after the reference frame they sit
+                between, so a decoder must buffer and re-sort by PTS before
+                display. WebRTC H.264 assumes no reordering (constrained
+                baseline semantics; our RTP path carries no DTS), so the
+                browser presents them in arrival order and the picture walks
+                backwards and forwards while still trending the right way.
+                Left unset, the VAAPI default supplies two of them, which is
+                exactly the period-3 measured on the Deck: one large
+                reference frame then two small ones, motion going
+                -60, +44, -22, -60, +37, -39 in the delivered stream while
+                the ring feeding it moved smoothly one way (3% direction
+                reversals at the ring vs 67% after the encoder). */
+                (*ctx_mut).max_b_frames = 0;
                 let frames_bref = ffmpeg::ffi::av_buffer_ref(self.hw_frames_ref);
                 if frames_bref.is_null() {
                     self.close();
