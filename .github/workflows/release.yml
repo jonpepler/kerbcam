@@ -173,13 +173,31 @@ jobs:
       # Core first so the registry has the dependency when react is indexed.
       # No NODE_AUTH_TOKEN: OIDC trusted publishing authenticates via the
       # id-token permission above, not a stored credential.
+      # Skip a version already on the registry rather than failing. A release
+      # can need re-running for reasons downstream of publishing (a broken
+      # runner image took out the GameData bundle on v1.9.0), and npm refuses to
+      # republish a version — so an unguarded publish makes the whole release
+      # unrepeatable and strands the bundle behind a job that can never go green
+      # again. Publishing itself stays exactly as it was.
       - name: Publish @ksp-gonogo/kerbcast to npm
         working-directory: client-sdk/typescript
-        run: npm publish
+        run: |
+          VER="$(node -p "require('./package.json').version")"
+          if npm view "@ksp-gonogo/kerbcast@${VER}" version >/dev/null 2>&1; then
+            echo "@ksp-gonogo/kerbcast@${VER} is already published; skipping"
+          else
+            npm publish
+          fi
 
       - name: Publish @ksp-gonogo/kerbcast-react to npm
         working-directory: client-sdk/react
-        run: npm publish
+        run: |
+          VER="$(node -p "require('./package.json').version")"
+          if npm view "@ksp-gonogo/kerbcast-react@${VER}" version >/dev/null 2>&1; then
+            echo "@ksp-gonogo/kerbcast-react@${VER} is already published; skipping"
+          else
+            npm publish
+          fi
 
   # One sidecar per supported runtime. Linux must build on ubuntu-22.04 (glibc
   # floor) with ffmpeg/libva for the tier-1 libva backend + sibling-lib bundle;
@@ -348,6 +366,9 @@ jobs:
       # out the shader workflow from 2026-07-23 and then the v1.9.0 release.
       # Supplying the tool lets the postinst complete.
       - name: Install Unity Hub postinst prerequisites
+        # Linux only: apt does not exist on the Windows runner, and Hub's
+        # Windows installer has no postinst to satisfy.
+        if: runner.os == 'Linux'
         run: sudo apt-get update -qq && sudo apt-get install -y desktop-file-utils
 
       - name: Set up Unity Hub + Editor
@@ -479,6 +500,9 @@ jobs:
       # out the shader workflow from 2026-07-23 and then the v1.9.0 release.
       # Supplying the tool lets the postinst complete.
       - name: Install Unity Hub postinst prerequisites
+        # Linux only: apt does not exist on the Windows runner, and Hub's
+        # Windows installer has no postinst to satisfy.
+        if: runner.os == 'Linux'
         run: sudo apt-get update -qq && sudo apt-get install -y desktop-file-utils
 
       - name: Set up Unity Hub + Editor

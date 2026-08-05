@@ -72,6 +72,9 @@ jobs:
       # silently disabled this workflow (and so ALL orientation coverage) from
       # 2026-07-23. Supplying the tool lets the postinst complete.
       - name: Install Unity Hub postinst prerequisites
+        # Linux only: apt does not exist on the Windows runner, and Hub's
+        # Windows installer has no postinst to satisfy.
+        if: runner.os == 'Linux'
         run: sudo apt-get update -qq && sudo apt-get install -y desktop-file-utils
 
       - name: Set up Unity Hub + Editor
