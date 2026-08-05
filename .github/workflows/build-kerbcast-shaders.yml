@@ -65,6 +65,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Unity Hub 3.20 (now the version apt serves) no longer lays itself out
+      # at /opt/unityhub/unityhub, which is where buildalon/unity-setup looks;
+      # it fails with ENOENT before Unity ever starts. That silently disabled
+      # this whole workflow after 2026-07-23. Hub is already on the runner
+      # image, so point the expected path at wherever it actually landed.
+      - name: Work around Unity Hub 3.20 layout change
+        run: |
+          set -x
+          sudo mkdir -p /opt/unityhub
+          ls -la /opt/unityhub || true
+          hub="$(command -v unityhub || true)"
+          echo "unityhub on PATH: ${hub:-<none>}"
+          if [ -n "$hub" ] && [ ! -e /opt/unityhub/unityhub ]; then
+            sudo ln -sf "$(readlink -f "$hub")" /opt/unityhub/unityhub
+          fi
+          ls -la /opt/unityhub || true
+
       - name: Set up Unity Hub + Editor
         uses: buildalon/unity-setup@v2
         with:
