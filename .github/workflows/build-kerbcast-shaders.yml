@@ -65,43 +65,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Unity Hub 3.20 (now the version apt serves) no longer lays itself out
-      # at /opt/unityhub/unityhub, which is where buildalon/unity-setup looks;
-      # it fails with ENOENT before Unity ever starts. That silently disabled
-      # this whole workflow after 2026-07-23. Hub is already on the runner
-      # image, so point the expected path at wherever it actually landed.
-      - name: Work around Unity Hub 3.20 layout change
-        run: |
-          set -x
-          # The runner image does NOT ship Hub; the action installs it and then
-          # probes /opt/unityhub/unityhub. Install it here first so we can see
-          # where 3.20 actually puts things, then satisfy that probe.
-          wget -qO- https://hub.unity3d.com/linux/keys/public \
-            | gpg --dearmor \
-            | sudo tee /usr/share/keyrings/Unity_Technologies_ApS.gpg >/dev/null
-          sudo sh -c 'echo "deb [signed-by=/usr/share/keyrings/Unity_Technologies_ApS.gpg] https://hub.unity3d.com/linux/repos/deb stable main" > /etc/apt/sources.list.d/unityhub.list'
-          sudo apt-get update -qq
-          sudo apt-get install -y unityhub
-          echo "=== package contents ==="
-          dpkg -L unityhub | grep -viE '/(share|doc|man|icons|applications)/' | head -40
-          echo "=== candidates ==="
-          hub="$(command -v unityhub || true)"
-          echo "on PATH: ${hub:-<none>}"
-          sudo mkdir -p /opt/unityhub
-          # Must be the EXECUTABLE, not the package directory: linking the dir
-          # satisfies the path probe and then fails "Unity Hub is not installed".
-          target=""
-          for c in /usr/lib/unityhub/unityhub /usr/lib/unityhub/unityhub-bin \
-                   /opt/unityhub/unityhub-bin "$hub"; do
-            if [ -f "$c" ] && [ -x "$c" ]; then target="$c"; break; fi
-          done
-          echo "hub executable: ${target:-<none>}"
-          if [ -n "$target" ] && [ ! -f /opt/unityhub/unityhub ]; then
-            sudo rm -f /opt/unityhub/unityhub
-            sudo ln -sf "$(readlink -f "$target")" /opt/unityhub/unityhub
-          fi
-          ls -la /opt/unityhub /usr/lib/unityhub 2>/dev/null | head -20 || true
-          /opt/unityhub/unityhub --headless help 2>&1 | head -5 || true
+      # Unity Hub's postinst calls update-desktop-database, which is absent on
+      # the runner image. The script fails, the package never finishes
+      # configuring, and /opt/unityhub/unityhub is never created — so
+      # buildalon/unity-setup dies with ENOENT before Unity starts. That
+      # silently disabled this workflow (and so ALL orientation coverage) from
+      # 2026-07-23. Supplying the tool lets the postinst complete.
+      - name: Install Unity Hub postinst prerequisites
+        run: sudo apt-get update -qq && sudo apt-get install -y desktop-file-utils
 
       - name: Set up Unity Hub + Editor
         uses: buildalon/unity-setup@v2

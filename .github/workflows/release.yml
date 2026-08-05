@@ -341,6 +341,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # Unity Hub's postinst calls update-desktop-database, which is absent on
+      # the runner image. The script fails, the package never finishes
+      # configuring, and /opt/unityhub/unityhub is never created — so
+      # buildalon/unity-setup dies with ENOENT before Unity starts. This took
+      # out the shader workflow from 2026-07-23 and then the v1.9.0 release.
+      # Supplying the tool lets the postinst complete.
+      - name: Install Unity Hub postinst prerequisites
+        run: sudo apt-get update -qq && sudo apt-get install -y desktop-file-utils
+
       - name: Set up Unity Hub + Editor
         uses: buildalon/unity-setup@v2
         with:
@@ -462,6 +471,15 @@ jobs:
           rm -f hullcam/HullCameraAssets/Assets/Editor/CreateAssetBundles.cs
           cp ci/hullcam-shaders/BuildShaderBundle.cs \
              hullcam/HullCameraAssets/Assets/Editor/BuildShaderBundle.cs
+
+      # Unity Hub's postinst calls update-desktop-database, which is absent on
+      # the runner image. The script fails, the package never finishes
+      # configuring, and /opt/unityhub/unityhub is never created — so
+      # buildalon/unity-setup dies with ENOENT before Unity starts. This took
+      # out the shader workflow from 2026-07-23 and then the v1.9.0 release.
+      # Supplying the tool lets the postinst complete.
+      - name: Install Unity Hub postinst prerequisites
+        run: sudo apt-get update -qq && sudo apt-get install -y desktop-file-utils
 
       - name: Set up Unity Hub + Editor
         uses: buildalon/unity-setup@v2
