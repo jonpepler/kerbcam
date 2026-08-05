@@ -504,12 +504,56 @@ namespace Kerbcast
             }
         }
 
+        /* Orientation ground truth, computed rather than eyeballed. The camera
+           itself tells us where a known world object MUST land in its frame;
+           comparing that against where the bright object actually is in the
+           captured pixels settles mirroring per camera and per axis, with no
+           reference image and no human judgement. A left-right mirror shows up
+           as measured x ~= 1 - expected x, an upside-down frame as
+           y ~= 1 - expected y. Sun first (a small, unambiguous bright point);
+           the body centre as a fallback when the Sun is behind the camera. */
+        private void LogExpectedSunViewport()
+        {
+            try
+            {
+                if (_nearCam == null) return;
+                var sun = Planetarium.fetch != null ? Planetarium.fetch.Sun : null;
+                if (sun == null) return;
+                Vector3 vp = _nearCam.WorldToViewportPoint(sun.transform.position);
+                string where = vp.z <= 0f ? "BEHIND"
+                    : (vp.x < 0f || vp.x > 1f || vp.y < 0f || vp.y > 1f) ? "offscreen" : "in-frame";
+                /* The Sun is the cleanest marker but is often behind the lens.
+                   The body being orbited is nearly always in view and its
+                   centre is just as well-defined a world point, so log both:
+                   between them every camera gets a reference it can be judged
+                   against without waiting for the orbit to come round. */
+                string body = "none";
+                var b = FlightGlobals.ActiveVessel != null ? FlightGlobals.ActiveVessel.mainBody : null;
+                if (b != null)
+                {
+                    Vector3 bv = _nearCam.WorldToViewportPoint(b.position);
+                    string bw = bv.z <= 0f ? "BEHIND"
+                        : (bv.x < 0f || bv.x > 1f || bv.y < 0f || bv.y > 1f) ? "offscreen" : "in-frame";
+                    body = $"{b.bodyName}Viewport=({bv.x:F3},{bv.y:F3}) {bw}";
+                }
+                Debug.Log(
+                    $"[Kerbcast][ORIENTDIAG] cam={FlightId} part={Mount.PartName} " +
+                    $"filter={(_cameraFilter != null ? _filterModeName : "none")} " +
+                    $"sunViewport=({vp.x:F3},{vp.y:F3}) z={vp.z:F0} {where} {body}");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[Kerbcast][ORIENTDIAG] cam={FlightId} failed: {ex.Message}");
+            }
+        }
+
         private void CaptureBlit(RenderTexture src, RenderTexture dst)
         {
             bool diag = KerbcastSettings.EnableBlitDiagnostics
                 && (++s_diagTick % DiagEveryFrames) == 0;
             float srcMean = 0f, srcPeak = 0f;
             if (diag) srcMean = ProbeLuminance(src, out srcPeak);
+            if (diag) LogExpectedSunViewport();
 
             if (_nvMaterial != null)
             {
