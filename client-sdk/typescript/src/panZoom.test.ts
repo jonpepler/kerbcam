@@ -387,6 +387,217 @@ describe("PanZoomController: nudge after echo-sync", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Outstanding setpoints: an echo captured mid-slew must not re-base the
+// accumulator behind where the camera is going. The plugin slews toward an
+// absolute at 90 deg/s and reports position at ~1Hz, so the first echo after
+// a nudge routinely carries the pre-command value.
+// ---------------------------------------------------------------------------
+
+describe("PanZoomController: outstanding setpoint", () => {
+  const WIDE = { ...DEFAULT_BOUNDS, panYawMin: -180, panYawMax: 180 };
+
+  it("ignores an echo carrying the pre-command position", () => {
+    const { sink, setPan } = makeSink();
+    const ctrl = new PanZoomController(sink, { panNudgeDeg: 5 });
+    ctrl.syncFromState({ ...WIDE, panYaw: 0 });
+    ctrl.nudgePan(1, 0);
+    expect(setPan).toHaveBeenLastCalledWith(5, 0);
+
+    // The measured case: an echo lands ~9ms later still reporting the old
+    // position. Adopting it would make the next nudge repeat this one.
+    ctrl.syncFromState({ ...WIDE, panYaw: 0 });
+    ctrl.nudgePan(1, 0);
+    expect(setPan).toHaveBeenLastCalledWith(10, 0);
+  });
+
+  it("releases the setpoint once an echo agrees with it", () => {
+    const { sink, setPan } = makeSink();
+    const ctrl = new PanZoomController(sink, { panNudgeDeg: 5 });
+    ctrl.syncFromState({ ...WIDE, panYaw: 0 });
+    ctrl.nudgePan(1, 0); // setpoint 5
+    ctrl.syncFromState({ ...WIDE, panYaw: 5 }); // arrived -- setpoint released
+    ctrl.syncFromState({ ...WIDE, panYaw: 20 }); // someone else moved it
+    ctrl.nudgePan(1, 0);
+    expect(setPan).toHaveBeenLastCalledWith(25, 0);
+  });
+
+  it("counts an echo within the settle epsilon as arrival", () => {
+    const { sink, setPan } = makeSink();
+    const ctrl = new PanZoomController(sink, {
+      panNudgeDeg: 5,
+      settleEpsilonDeg: 0.5,
+    });
+    ctrl.syncFromState({ ...WIDE, panYaw: 0 });
+    ctrl.nudgePan(1, 0); // setpoint 5
+    ctrl.syncFromState({ ...WIDE, panYaw: 4.7 }); // within 0.5 -- adopted
+    ctrl.nudgePan(1, 0);
+    expect(setPan).toHaveBeenLastCalledWith(9.7, 0);
+  });
+
+  it("holds until BOTH axes arrive", () => {
+    const { sink, setPan } = makeSink();
+    const ctrl = new PanZoomController(sink, { panNudgeDeg: 30 });
+    const bounds = { ...WIDE, panPitchMin: -90, panPitchMax: 90 };
+    ctrl.syncFromState({ ...bounds, panYaw: 0, panPitch: 0 });
+    ctrl.nudgePan(1, 1); // setpoint (30, 30)
+    ctrl.syncFromState({ ...bounds, panYaw: 30, panPitch: 0 }); // pitch mid-slew
+    ctrl.nudgePan(1, 1);
+    expect(setPan).toHaveBeenLastCalledWith(60, 60);
+  });
+
+  it("gives up when the camera moves but stops closing on the setpoint", () => {
+    const { sink, setPan } = makeSink();
+    const ctrl = new PanZoomController(sink, {
+      panNudgeDeg: 30,
+      settleStallEchoes: 2,
+    });
+    ctrl.syncFromState({ ...WIDE, panYaw: 0 });
+    ctrl.nudgePan(1, 0); // setpoint 30
+
+    // Something else owns the camera (another operator, or auto-track): it is
+    // moving, but away from our setpoint.
+    ctrl.syncFromState({ ...WIDE, panYaw: 10 }); // closing, no verdict yet
+    ctrl.syncFromState({ ...WIDE, panYaw: 5 }); // stall 1
+    ctrl.syncFromState({ ...WIDE, panYaw: 0 }); // stall 2 -- adopt reality
+    ctrl.nudgePan(1, 0);
+    expect(setPan).toHaveBeenLastCalledWith(30, 0);
+  });
+
+  it("does not count repeated identical echoes toward the stall", () => {
+    // The sidecar re-broadcasts camera state on unrelated changes (bitrate,
+    // degrade), each carrying the same ~1Hz plugin pan reading. Those are not
+    // evidence that the camera stopped closing.
+    const { sink, setPan } = makeSink();
+    const ctrl = new PanZoomController(sink, {
+      panNudgeDeg: 30,
+      settleStallEchoes: 2,
+    });
+    ctrl.syncFromState({ ...WIDE, panYaw: 0 });
+    ctrl.nudgePan(1, 0); // setpoint 30
+    for (let i = 0; i < 5; i++) ctrl.syncFromState({ ...WIDE, panYaw: 10 });
+    ctrl.nudgePan(1, 0);
+    expect(setPan).toHaveBeenLastCalledWith(60, 0);
+  });
+
+  it("releases the setpoint after the timeout backstop", async () => {
+    vi.useFakeTimers();
+    try {
+      const { sink, setPan } = makeSink();
+      const ctrl = new PanZoomController(sink, {
+        panNudgeDeg: 30,
+        settleTimeoutMs: 6000,
+      });
+      ctrl.syncFromState({ ...WIDE, panYaw: 0 });
+      ctrl.nudgePan(1, 0); // setpoint 30
+
+      // Camera parks short and reports the same position forever, which the
+      // stall rule cannot see. The timeout is the way out.
+      ctrl.syncFromState({ ...WIDE, panYaw: 10 });
+      await vi.advanceTimersByTimeAsync(6000);
+      ctrl.syncFromState({ ...WIDE, panYaw: 10 });
+      ctrl.nudgePan(1, 0);
+      expect(setPan).toHaveBeenLastCalledWith(40, 0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("drops the setpoint when a pan rate takes over", () => {
+    const { sink, setPan } = makeSink();
+    const ctrl = new PanZoomController(sink, { panNudgeDeg: 30 });
+    ctrl.syncFromState({ ...WIDE, panYaw: 0 });
+    ctrl.nudgePan(1, 0); // setpoint 30
+    ctrl.setPanRate(0.5, 0);
+    ctrl.setPanRate(0, 0); // hold over; camera is wherever the rate left it
+    ctrl.syncFromState({ ...WIDE, panYaw: 10 });
+    ctrl.nudgePan(1, 0);
+    expect(setPan).toHaveBeenLastCalledWith(40, 0);
+  });
+
+  it("drops the setpoint when the ball is grabbed", () => {
+    const { sink, setPan } = makeSink();
+    const ctrl = new PanZoomController(sink, { panNudgeDeg: 30 });
+    ctrl.syncFromState({ ...WIDE, panYaw: 0 });
+    ctrl.nudgePan(1, 0); // setpoint 30
+    ctrl.setBallDragging(true);
+    ctrl.setBallDragging(false);
+    ctrl.syncFromState({ ...WIDE, panYaw: 10 });
+    ctrl.nudgePan(1, 0);
+    expect(setPan).toHaveBeenLastCalledWith(40, 0);
+  });
+
+  it("drops the setpoint on stop", () => {
+    const { sink, setPan } = makeSink();
+    const ctrl = new PanZoomController(sink, { panNudgeDeg: 30 });
+    ctrl.syncFromState({ ...WIDE, panYaw: 0 });
+    ctrl.nudgePan(1, 0); // setpoint 30
+    ctrl.stop();
+    ctrl.syncFromState({ ...WIDE, panYaw: 10 });
+    ctrl.nudgePan(1, 0);
+    expect(setPan).toHaveBeenLastCalledWith(40, 0);
+  });
+
+  it("keeps applying echoed bounds while a setpoint is outstanding", () => {
+    // Bounds are camera metadata, not a position: holding them back would
+    // clamp later nudges against a stale travel limit.
+    const { sink, setPan } = makeSink();
+    const ctrl = new PanZoomController(sink, { panNudgeDeg: 30 });
+    ctrl.syncFromState({ ...WIDE, panYaw: 0 });
+    ctrl.nudgePan(1, 0); // setpoint 30
+    ctrl.syncFromState({ ...WIDE, panYaw: 0, panYawMax: 45 });
+    ctrl.nudgePan(1, 0);
+    expect(setPan).toHaveBeenLastCalledWith(45, 0);
+  });
+
+  it("does not let an in-transit fov echo drag the slider back", async () => {
+    vi.useFakeTimers();
+    try {
+      const { sink, setFov } = makeSink();
+      const ctrl = new PanZoomController(sink, {
+        fovNudgeDeg: 5,
+        fovSliderDebounceMs: 120,
+      });
+      ctrl.syncFromState({ ...DEFAULT_BOUNDS, fov: 60 });
+      ctrl.fovSliderInput(30);
+      await vi.advanceTimersByTimeAsync(120);
+      expect(setFov).toHaveBeenLastCalledWith(30);
+
+      // Plugin is still slewing 60 -> 30 and reports 60. Adopting it would
+      // visibly snap the slider back and re-base the next zoom nudge.
+      ctrl.syncFromState({ ...DEFAULT_BOUNDS, fov: 60 });
+      expect(ctrl.sliderFov).toBe(30);
+      ctrl.nudgeZoom(-1);
+      expect(setFov).toHaveBeenLastCalledWith(25);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("releases the fov setpoint once the echo agrees", () => {
+    const { sink, setFov } = makeSink();
+    const ctrl = new PanZoomController(sink, { fovNudgeDeg: 5 });
+    ctrl.syncFromState({ ...DEFAULT_BOUNDS, fov: 60 });
+    ctrl.nudgeZoom(-1); // setpoint 55
+    ctrl.syncFromState({ ...DEFAULT_BOUNDS, fov: 55 }); // arrived
+    ctrl.syncFromState({ ...DEFAULT_BOUNDS, fov: 40 }); // someone else zoomed
+    ctrl.nudgeZoom(-1);
+    expect(setFov).toHaveBeenLastCalledWith(35);
+  });
+
+  it("drops the fov setpoint when a zoom rate takes over", () => {
+    const { sink, setFov } = makeSink();
+    const ctrl = new PanZoomController(sink, { fovNudgeDeg: 5 });
+    ctrl.syncFromState({ ...DEFAULT_BOUNDS, fov: 60 });
+    ctrl.nudgeZoom(-1); // setpoint 55
+    ctrl.setZoomRate(1);
+    ctrl.setZoomRate(0);
+    ctrl.syncFromState({ ...DEFAULT_BOUNDS, fov: 40 });
+    ctrl.nudgeZoom(-1);
+    expect(setFov).toHaveBeenLastCalledWith(35);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // onSliderFov subscription management
 // ---------------------------------------------------------------------------
 

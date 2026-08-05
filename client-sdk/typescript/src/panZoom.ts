@@ -2,7 +2,7 @@
  * Headless pan/zoom control state machine extracted from the CameraFeed
  * component. Manages rate deduplication, analog deadzone, optimistic
  * accumulators for discrete nudges, debounced FoV slider, and echo-sync
- * while idle -- all without any DOM or React dependency.
+ * while idle and settled -- all without any DOM or React dependency.
  *
  * `KerbcastCameraHandle` satisfies `PanZoomCommandSink` structurally: pass a
  * camera handle directly as the sink and the controller will drive it.
@@ -81,6 +81,31 @@ export interface PanZoomControllerOptions {
    * Default: 0.05.
    */
   analogDeadzone?: number;
+  /**
+   * How close an echo has to get to an outstanding setpoint (degrees) before
+   * the camera counts as having arrived. Wider than the plugin's own 0.01
+   * degree reporting threshold so a rounding difference does not hold the
+   * setpoint open.
+   * Default: 0.5.
+   */
+  settleEpsilonDeg?: number;
+  /**
+   * How many consecutive *moving* echoes may fail to close on an outstanding
+   * setpoint before the controller gives up and adopts what the camera
+   * reports. Catches something else owning the camera (another operator, or
+   * auto-track) without waiting out the full timeout.
+   * Default: 2.
+   */
+  settleStallEchoes?: number;
+  /**
+   * Hard cap (ms) on how long a setpoint is held against echoes. Backstop for
+   * a camera that parks short of the setpoint and then reports the same
+   * position forever (a bounds mismatch would do it), which no
+   * progress-based rule can detect. Sized for the worst real case: 360
+   * degrees of yaw at 90 deg/s plus the plugin's ~1Hz status write.
+   * Default: 6000.
+   */
+  settleTimeoutMs?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -93,6 +118,27 @@ function clamp(v: number, lo: number, hi: number): number {
 
 function applyDeadzone(v: number, deadzone: number): number {
   return Math.abs(v) < deadzone ? 0 : v;
+}
+
+/*
+  Bookkeeping for an absolute setpoint the camera has been asked for but has
+  not been observed to reach. The plugin slews toward a setpoint at a fixed
+  rate (90 deg/s of yaw, 60 deg/s of FoV) and reports its position at ~1Hz, so
+  echoes arriving during the slew carry positions the camera has already left.
+  Feeding those to the accumulator would re-base the next nudge on a stale
+  position and lose travel.
+*/
+interface Settling {
+  /* Remaining distance measured at the previous echo; null before the first. */
+  lastDistance: number | null;
+  /* Consecutive moving echoes that failed to close on the setpoint. */
+  stalls: number;
+  /* Wall clock at issue, for the timeout backstop. */
+  issuedAt: number;
+}
+
+function newSettling(): Settling {
+  return { lastDistance: null, stalls: 0, issuedAt: Date.now() };
 }
 
 // ---------------------------------------------------------------------------
@@ -111,6 +157,9 @@ export class PanZoomController {
   private readonly fovNudgeDeg: number;
   private readonly fovSliderDebounceMs: number;
   private readonly analogDeadzone: number;
+  private readonly settleEpsilonDeg: number;
+  private readonly settleStallEchoes: number;
+  private readonly settleTimeoutMs: number;
 
   // Last-sent rates (dedupe against re-sending the same value).
   private sentPanRate = { yaw: 0, pitch: 0 };
@@ -119,6 +168,16 @@ export class PanZoomController {
   // Optimistic accumulators for discrete nudges.
   private localPan = { yaw: 0, pitch: 0 };
   private localFov = 0;
+
+  /*
+    Outstanding absolute setpoints. Non-null from the moment a setPan / setFov
+    goes out until an echo shows the camera got there (or one of `settled`'s
+    give-up rules fires). While one is outstanding the accumulator holds the
+    setpoint and echoes do not touch it.
+  */
+  private panSetpoint: (Settling & { yaw: number; pitch: number }) | null =
+    null;
+  private fovSetpoint: (Settling & { fov: number }) | null = null;
 
   // FoV slider state.
   private _sliderFov = 0;
@@ -148,6 +207,9 @@ export class PanZoomController {
     this.fovNudgeDeg = opts.fovNudgeDeg ?? 5;
     this.fovSliderDebounceMs = opts.fovSliderDebounceMs ?? 120;
     this.analogDeadzone = opts.analogDeadzone ?? 0.05;
+    this.settleEpsilonDeg = opts.settleEpsilonDeg ?? 0.5;
+    this.settleStallEchoes = opts.settleStallEchoes ?? 2;
+    this.settleTimeoutMs = opts.settleTimeoutMs ?? 6000;
   }
 
   // ---------------------------------------------------------------------------
@@ -174,6 +236,12 @@ export class PanZoomController {
    * Applies the echoed FoV to the accumulator and slider only when the
    * controller is zoom-idle (zoom rate 0, slider not dragging, no pending
    * debounced send). Mirrors CameraFeed.tsx:370-387.
+   *
+   * An echo is also held off while an absolute setpoint we sent is still
+   * outstanding: the plugin slews toward a setpoint and reports its position
+   * at ~1Hz, so echoes in that window carry positions the camera has already
+   * left, and adopting one would re-base the next nudge behind where the
+   * camera is going.
    */
   syncFromState(
     state: { fov: number; panYaw: number; panPitch: number } & PanZoomBounds,
@@ -191,7 +259,7 @@ export class PanZoomController {
       !this.ballDragging &&
       this.sentPanRate.yaw === 0 &&
       this.sentPanRate.pitch === 0;
-    if (panIdle) {
+    if (panIdle && this.panEchoWins(state.panYaw, state.panPitch)) {
       this.localPan = { yaw: state.panYaw, pitch: state.panPitch };
     }
 
@@ -199,7 +267,7 @@ export class PanZoomController {
       this.sentZoomRate === 0 &&
       !this.sliderDragging &&
       this.pendingFov === null;
-    if (zoomIdle) {
+    if (zoomIdle && this.fovEchoWins(state.fov)) {
       this.localFov = state.fov;
       this.setSliderFovInternal(state.fov);
     }
@@ -219,6 +287,9 @@ export class PanZoomController {
     const p = applyDeadzone(clamp(pitch, -1, 1), this.analogDeadzone);
     if (y === this.sentPanRate.yaw && p === this.sentPanRate.pitch) return;
     this.sentPanRate = { yaw: y, pitch: p };
+    // A rate supersedes any absolute we were still waiting on, including the
+    // zero that ends the hold: the camera is wherever the rate left it.
+    this.panSetpoint = null;
     void this.sink.setPanRate(y, p);
   }
 
@@ -245,6 +316,7 @@ export class PanZoomController {
     const r = applyDeadzone(clamp(rate, -1, 1), this.analogDeadzone);
     if (r === this.sentZoomRate) return;
     this.sentZoomRate = r;
+    this.fovSetpoint = null; // same reasoning as setPanRate
     void this.sink.setZoomRate(r);
   }
 
@@ -269,6 +341,11 @@ export class PanZoomController {
       b.panPitchMin,
       b.panPitchMax,
     );
+    this.panSetpoint = {
+      yaw: this.localPan.yaw,
+      pitch: this.localPan.pitch,
+      ...newSettling(),
+    };
     void this.sink.setPan(this.localPan.yaw, this.localPan.pitch);
   }
 
@@ -285,6 +362,7 @@ export class PanZoomController {
       b.fovMax,
     );
     this.localFov = next;
+    this.fovSetpoint = { fov: next, ...newSettling() };
     void this.sink.setFov(next);
   }
 
@@ -342,6 +420,8 @@ export class PanZoomController {
    */
   setBallDragging(dragging: boolean): void {
     this.ballDragging = dragging;
+    // Taking the ball abandons any absolute we were waiting on.
+    if (dragging) this.panSetpoint = null;
   }
 
   // ---------------------------------------------------------------------------
@@ -365,6 +445,9 @@ export class PanZoomController {
     }
     this.ballDragging = false;
     this.sliderDragging = false;
+    // Nothing is being commanded any more, so echoes win again.
+    this.panSetpoint = null;
+    this.fovSetpoint = null;
     if (this.fovDebounceTimer !== null) {
       clearTimeout(this.fovDebounceTimer);
       this.fovDebounceTimer = null;
@@ -394,8 +477,57 @@ export class PanZoomController {
       const fov = clamp(this.pendingFov, this.bounds.fovMin, this.bounds.fovMax);
       this.localFov = fov;
       this.pendingFov = null;
+      this.fovSetpoint = { fov, ...newSettling() };
       void this.sink.setFov(fov);
     }
+  }
+
+  /*
+    Whether an echoed pan should be adopted into the accumulator. True when
+    nothing is outstanding, or when the outstanding setpoint has been settled
+    one way or another (in which case it is cleared and the camera's own
+    reading wins from here).
+  */
+  private panEchoWins(yaw: number, pitch: number): boolean {
+    const sp = this.panSetpoint;
+    if (sp === null) return true;
+    const distance = Math.max(
+      Math.abs(yaw - sp.yaw),
+      Math.abs(pitch - sp.pitch),
+    );
+    if (!this.settled(sp, distance)) return false;
+    this.panSetpoint = null;
+    return true;
+  }
+
+  /* `panEchoWins` for FoV. */
+  private fovEchoWins(fov: number): boolean {
+    const sp = this.fovSetpoint;
+    if (sp === null) return true;
+    if (!this.settled(sp, Math.abs(fov - sp.fov))) return false;
+    this.fovSetpoint = null;
+    return true;
+  }
+
+  /*
+    Give up on an outstanding setpoint when the camera arrived, when it is
+    moving but no longer closing on it (something else owns the camera: another
+    operator, or auto-track), or when the timeout backstop expires (it parked
+    short and is reporting the same position forever, which no progress-based
+    rule can see). Mutates the settling bookkeeping.
+  */
+  private settled(sp: Settling, distance: number): boolean {
+    const eps = this.settleEpsilonDeg;
+    if (distance <= eps) return true;
+    if (Date.now() - sp.issuedAt >= this.settleTimeoutMs) return true;
+    const prev = sp.lastDistance;
+    sp.lastDistance = distance;
+    if (prev === null) return false;
+    const moved = Math.abs(prev - distance) > eps;
+    const closing = distance < prev - eps;
+    if (!moved) return false;
+    sp.stalls = closing ? 0 : sp.stalls + 1;
+    return sp.stalls >= this.settleStallEchoes;
   }
 
   private setSliderFovInternal(fov: number): void {
