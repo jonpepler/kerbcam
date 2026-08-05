@@ -365,19 +365,20 @@ jobs:
       # buildalon/unity-setup dies with ENOENT before Unity starts. This took
       # out the shader workflow from 2026-07-23 and then the v1.9.0 release.
       # Supplying the tool lets the postinst complete.
-      - name: Install Unity Hub and satisfy the setup action's expected path
+      - name: Install a Unity Hub version the setup action can find
         # Linux only: apt does not exist on the Windows runner.
         #
-        # Two separate breakages, both confirmed from CI logs:
-        #  1. Hub's postinst calls update-desktop-database, absent on the runner,
-        #     so the package never finished configuring. desktop-file-utils fixes
-        #     that (the error is gone from the log).
-        #  2. Hub 3.20 installs its binary at /usr/lib/unityhub/unityhub, but
-        #     buildalon/unity-setup probes /opt/unityhub/unityhub and dies with
-        #     ENOENT before Unity starts. Install Hub here so the layout is
-        #     known, then point the expected path at the real EXECUTABLE —
-        #     linking the package DIRECTORY instead satisfies the probe and then
-        #     fails the action's own is-installed check.
+        # Hub 3.20 moved its binary to /usr/lib/unityhub/unityhub, while
+        # buildalon/unity-setup requires an install at /opt/unityhub/unityhub —
+        # and symlinking the expected path is not enough, the action's own
+        # is-installed check still rejects it. So pin the newest pre-3.20 Hub,
+        # which installs where the action expects. Its postinst also calls
+        # update-desktop-database, absent on the runner, so install that first
+        # or the package never finishes configuring.
+        #
+        # This is why the shader workflow had no green run after 2026-07-23 and
+        # why the v1.9.0 GameData bundle failed: the runner silently moved to
+        # 3.20. Print the candidates so the next drift is visible, not silent.
         if: runner.os == 'Linux'
         run: |
           set -eux
@@ -388,16 +389,17 @@ jobs:
             | sudo tee /usr/share/keyrings/Unity_Technologies_ApS.gpg >/dev/null
           sudo sh -c 'echo "deb [signed-by=/usr/share/keyrings/Unity_Technologies_ApS.gpg] https://hub.unity3d.com/linux/repos/deb stable main" > /etc/apt/sources.list.d/unityhub.list'
           sudo apt-get update -qq
-          sudo apt-get install -y unityhub
-          target=""
-          for c in /usr/lib/unityhub/unityhub /opt/unityhub/unityhub-bin "$(command -v unityhub || true)"; do
-            if [ -n "$c" ] && [ -f "$c" ] && [ -x "$c" ]; then target="$c"; break; fi
-          done
-          echo "hub executable: ${target:-<none>}"
-          test -n "$target"
-          sudo mkdir -p /opt/unityhub
-          [ -f /opt/unityhub/unityhub ] || sudo ln -sf "$(readlink -f "$target")" /opt/unityhub/unityhub
-          ls -la /opt/unityhub
+          echo "=== available unityhub versions ==="
+          apt-cache madison unityhub || true
+          VER="$(apt-cache madison unityhub | awk '{print $3}' | grep -v '^3\.20' | head -1)"
+          echo "pinning unityhub ${VER:-<none found, using latest>}"
+          if [ -n "$VER" ]; then
+            sudo apt-get install -y "unityhub=$VER"
+            sudo apt-mark hold unityhub
+          else
+            sudo apt-get install -y unityhub
+          fi
+          ls -la /opt/unityhub || true
 
       - name: Set up Unity Hub + Editor
         uses: buildalon/unity-setup@v2
@@ -527,19 +529,20 @@ jobs:
       # buildalon/unity-setup dies with ENOENT before Unity starts. This took
       # out the shader workflow from 2026-07-23 and then the v1.9.0 release.
       # Supplying the tool lets the postinst complete.
-      - name: Install Unity Hub and satisfy the setup action's expected path
+      - name: Install a Unity Hub version the setup action can find
         # Linux only: apt does not exist on the Windows runner.
         #
-        # Two separate breakages, both confirmed from CI logs:
-        #  1. Hub's postinst calls update-desktop-database, absent on the runner,
-        #     so the package never finished configuring. desktop-file-utils fixes
-        #     that (the error is gone from the log).
-        #  2. Hub 3.20 installs its binary at /usr/lib/unityhub/unityhub, but
-        #     buildalon/unity-setup probes /opt/unityhub/unityhub and dies with
-        #     ENOENT before Unity starts. Install Hub here so the layout is
-        #     known, then point the expected path at the real EXECUTABLE —
-        #     linking the package DIRECTORY instead satisfies the probe and then
-        #     fails the action's own is-installed check.
+        # Hub 3.20 moved its binary to /usr/lib/unityhub/unityhub, while
+        # buildalon/unity-setup requires an install at /opt/unityhub/unityhub —
+        # and symlinking the expected path is not enough, the action's own
+        # is-installed check still rejects it. So pin the newest pre-3.20 Hub,
+        # which installs where the action expects. Its postinst also calls
+        # update-desktop-database, absent on the runner, so install that first
+        # or the package never finishes configuring.
+        #
+        # This is why the shader workflow had no green run after 2026-07-23 and
+        # why the v1.9.0 GameData bundle failed: the runner silently moved to
+        # 3.20. Print the candidates so the next drift is visible, not silent.
         if: runner.os == 'Linux'
         run: |
           set -eux
@@ -550,16 +553,17 @@ jobs:
             | sudo tee /usr/share/keyrings/Unity_Technologies_ApS.gpg >/dev/null
           sudo sh -c 'echo "deb [signed-by=/usr/share/keyrings/Unity_Technologies_ApS.gpg] https://hub.unity3d.com/linux/repos/deb stable main" > /etc/apt/sources.list.d/unityhub.list'
           sudo apt-get update -qq
-          sudo apt-get install -y unityhub
-          target=""
-          for c in /usr/lib/unityhub/unityhub /opt/unityhub/unityhub-bin "$(command -v unityhub || true)"; do
-            if [ -n "$c" ] && [ -f "$c" ] && [ -x "$c" ]; then target="$c"; break; fi
-          done
-          echo "hub executable: ${target:-<none>}"
-          test -n "$target"
-          sudo mkdir -p /opt/unityhub
-          [ -f /opt/unityhub/unityhub ] || sudo ln -sf "$(readlink -f "$target")" /opt/unityhub/unityhub
-          ls -la /opt/unityhub
+          echo "=== available unityhub versions ==="
+          apt-cache madison unityhub || true
+          VER="$(apt-cache madison unityhub | awk '{print $3}' | grep -v '^3\.20' | head -1)"
+          echo "pinning unityhub ${VER:-<none found, using latest>}"
+          if [ -n "$VER" ]; then
+            sudo apt-get install -y "unityhub=$VER"
+            sudo apt-mark hold unityhub
+          else
+            sudo apt-get install -y unityhub
+          fi
+          ls -la /opt/unityhub || true
 
       - name: Set up Unity Hub + Editor
         uses: buildalon/unity-setup@v2
