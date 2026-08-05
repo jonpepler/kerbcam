@@ -111,6 +111,13 @@ jobs:
             sudo apt-get install -y unityhub
           fi
           ls -la /opt/unityhub || true
+          # The action spawns a binary called `unity-hub` (hyphenated); the
+          # package provides `unityhub`. Without this alias it fails with
+          # "spawn unity-hub ENOENT" even though Hub is correctly installed.
+          if [ -x /opt/unityhub/unityhub ] && [ ! -e /usr/bin/unity-hub ]; then
+            sudo ln -sf /opt/unityhub/unityhub /usr/bin/unity-hub
+          fi
+          command -v unity-hub unityhub || true
 
       - name: Set up Unity Hub + Editor
         uses: buildalon/unity-setup@v2
