@@ -169,6 +169,12 @@ namespace Kerbcast
         // Set false to skip the filter pass (pure unfiltered composite).
         public static bool EnableHullcamEffects { get; private set; } = true;
 
+        // Diagnostic: sample capture-RT luminance immediately before and after the
+        // filter pass and log both, so a blackened frame can be attributed to the
+        // filter rather than inferred from the far end of the pipeline. Throttled;
+        // off by default.
+        public static bool EnableBlitDiagnostics { get; private set; } = false;
+
         // Run TUFX post-processing on each layered kerbcast camera when TUFX
         // is installed. Without it, atmospheric scattering on Kerbin's horizon
         // has too wide a dynamic range to display correctly even with
@@ -444,6 +450,7 @@ namespace Kerbcast
             ApplyBool(node, "EnableAtmosphericFx", v => settings.EnableAtmosphericFx = v);
             ApplyString(node, "AtmosphericFxLayers", v => settings.AtmosphericFxLayers = ParseAtmoFxLayers(v));
             ApplyBool(node, "EnableHullcamEffects", v => EnableHullcamEffects = v);
+            ApplyBool(node, "EnableBlitDiagnostics", v => EnableBlitDiagnostics = v);
             ApplyBool(node, "EnableTUFX", v => EnableTUFX = v);
             ApplyBool(node, "EnableEVE", v => EnableEVE = v);
             ApplyBool(node, "EnableScatterer", v => EnableScatterer = v);
