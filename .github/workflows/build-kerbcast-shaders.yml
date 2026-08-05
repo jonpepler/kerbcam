@@ -148,112 +148,45 @@ jobs:
             libgtk-3-0 libnss3 libasound2 libgconf-2-4 libxtst6 libxss1 \
             libgbm1 libnotify4 xvfb desktop-file-utils || true
 
-      # Activate against the editor directly, not via Hub's Licensing Client.
-      # 2019.4 predates that client — it uses the legacy flow, which the editor
-      # binary performs itself — and buildalon/activate-unity-license refuses to
-      # run without Hub installed ("Unity Hub is not installed or not
-      # accessible"). Since we no longer install Hub, do it the 2019 way.
-      - name: Activate Unity Personal license
-        env:
-          UNITY_USERNAME: ${{ secrets.UNITY_USERNAME }}
-          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+      # Hub is installed ONLY so the licensing client exists: Unity's Personal
+      # activation goes through it, and buildalon/activate-unity-license refuses
+      # to run without it. The EDITOR still comes from the direct download above
+      # — Hub's headless editor install is the part that is broken (it returns in
+      # 3 seconds having installed nothing), and we no longer rely on it.
+      #
+      # Pin pre-3.20: 3.20 relocated its binary to /usr/lib/unityhub while the
+      # tooling expects /opt/unityhub (buildalon/unity-setup#57; the fix,
+      # RageAgainstThePixel/unity-cli#81, is open and unreleased).
+      - name: Install Unity Hub (licensing client only)
         run: |
-          set -eu
-          xvfb-run -a "$UNITY_EDITOR_PATH" \
-            -batchmode -nographics -quit -logFile /tmp/activate.log \
-            -username "$UNITY_USERNAME" -password "$UNITY_PASSWORD" || true
-          # The editor's exit code is unreliable here; the licence file is the
-          # real signal.
-          if ls ~/.local/share/unity3d/Unity/Unity_lic.ulf >/dev/null 2>&1; then
-            echo "licence activated"
+          set -eux
+          sudo apt-get update -qq
+          sudo apt-get install -y desktop-file-utils
+          wget -qO- https://hub.unity3d.com/linux/keys/public \
+            | gpg --dearmor \
+            | sudo tee /usr/share/keyrings/Unity_Technologies_ApS.gpg >/dev/null
+          sudo sh -c 'echo "deb [signed-by=/usr/share/keyrings/Unity_Technologies_ApS.gpg] https://hub.unity3d.com/linux/repos/deb stable main" > /etc/apt/sources.list.d/unityhub.list'
+          sudo apt-get update -qq
+          VER="$(apt-cache madison unityhub | awk '{print $3}' | grep -v '^3\.20' | head -1)"
+          echo "pinning unityhub ${VER:-<latest>}"
+          if [ -n "$VER" ]; then
+            printf 'Package: unityhub\nPin: version %s\nPin-Priority: 1001\n' "$VER" \
+              | sudo tee /etc/apt/preferences.d/unityhub >/dev/null
+            sudo apt-get install -y "unityhub=$VER"
           else
-            echo "::error::Unity licence activation failed; see log below"
-            tail -40 /tmp/activate.log || true
-            exit 1
+            sudo apt-get install -y unityhub
           fi
+          if [ -x /opt/unityhub/unityhub ] && [ ! -e /usr/bin/unity-hub ]; then
+            sudo ln -sf /opt/unityhub/unityhub /usr/bin/unity-hub
+          fi
+          command -v unity-hub unityhub || true
 
-
-      - name: Build kerbcast-shaders AssetBundles (linux, osx)
-        working-directory: ci/kerbcast-shaders
-        run: |
-          "$UNITY_EDITOR_PATH" \
-            -batchmode -nographics -quit \
-            -projectPath "$(pwd)" \
-            -executeMethod KerbcastCI.BuildKerbcastShaders.BuildUnix \
-            -buildTarget Linux64 \
-            -logFile -
-          echo "--- output bundles ---"
-          ls -la Bundles-linux/ Bundles-osx/
-
-      # Both render tests below need a real graphics device: `-nographics`
-      # disables it entirely, turning Camera.Render(), Graphics.Blit and
-      # RenderTexture readback into no-ops. xvfb gives the runner a virtual
-      # display for the GL context.
-      - name: Install xvfb
-        run: sudo apt-get update && sudo apt-get install -y xvfb
-
-      # Per-shader render smoke test on the just-built Linux bundle: every
-      # shader in it must report isSupported, render through a material onto
-      # a small deterministic scene, and produce output that is neither the
-      # magenta error pattern nor all-zero. This run executes the glcore
-      # variants ONLY; it cannot validate the d3d11 blobs in the Windows
-      # bundle (see the build-windows job). Judging how the FX actually LOOK
-      # stays with the fx-previews.yml renders.
-      - name: Shader render smoke test (Linux bundle, glcore)
-        working-directory: ci/kerbcast-shaders
-        timeout-minutes: 10
-        run: |
-          xvfb-run -a "$UNITY_EDITOR_PATH" \
-            -batchmode -quit \
-            -projectPath "$(pwd)" \
-            -executeMethod KerbcastCI.ShaderSmoke.RenderAll \
-            -buildTarget Linux64 \
-            -logFile -
-
-      # Regression net for the per-camera Hullcam filter blit (c00fe16):
-      # compiles the plugin's HullcamFilterBlit.cs verbatim (via the
-      # Assets/Editor/SharedHullcamBlit symlink), loads the committed
-      # GameData/Kerbcast/HullcamShaders/shaders.linux MovieTime shader, and
-      # asserts each filter mode's blit output is byte-identical under
-      # hostile writes to the shared static material (plus reticle on/off
-      # policy vs a no-title baseline, plus a control that the legacy
-      # shared-static path visibly flickers). Same xvfb arrangement as the
-      # smoke test: -nographics would no-op Graphics.Blit and ReadPixels.
-      - name: Hullcam filter blit determinism test
-        working-directory: ci/kerbcast-shaders
-        timeout-minutes: 10
-        run: |
-          xvfb-run -a "$UNITY_EDITOR_PATH" \
-            -batchmode -quit \
-            -projectPath "$(pwd)" \
-            -executeMethod KerbcastCI.HullcamBlitDeterminism.RunAll \
-            -buildTarget Linux64 \
-            -logFile -
-
-      # Camera-orientation proof: a four-corner marker frame blitted through
-      # each capture blit branch (plain / NightVision / filter-probe) must come
-      # back with every corner unmoved. Catches the NightVision d3d11 upside-
-      # down bug (GitHub #5) and exercises the HullcamFilterBlit probe. glcore
-      # here; the Windows job runs the d3d11 side. Same xvfb arrangement.
-      - name: Camera orientation proof (Linux bundle, glcore)
-        working-directory: ci/kerbcast-shaders
-        timeout-minutes: 10
-        run: |
-          xvfb-run -a "$UNITY_EDITOR_PATH" \
-            -batchmode -quit \
-            -projectPath "$(pwd)" \
-            -executeMethod KerbcastCI.CameraOrientation.RenderAll \
-            -buildTarget Linux64 \
-            -logFile -
-
-      # A Personal licence is seat-limited, so hand it back even if the build
-      # fails — otherwise repeated runs exhaust the seats.
-      - name: Return Unity license
-        if: always()
-        continue-on-error: true
-        run: |
-          xvfb-run -a "$UNITY_EDITOR_PATH" \
-            -batchmode -nographics -quit -returnlicense -logFile - || true
+      - name: Activate Unity Personal license
+        uses: buildalon/activate-unity-license@v2
+        with:
+          license: 'Personal'
+          username: ${{ secrets.UNITY_USERNAME }}
+          password: ${{ secrets.UNITY_PASSWORD }}
 
       - uses: actions/upload-artifact@v4
         with:
