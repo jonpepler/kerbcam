@@ -80,30 +80,23 @@ namespace KerbcastCI
 
                 CheckFilterBranch("filter-probe", src, failures);
 
-                /* SHIPPED-CHAIN branches: the same passes with CaptureCore's
-                   final correction appended, which is what a viewer actually
-                   receives. An UNFILTERED camera (plain) and a FILTERED one
-                   (filter-probe) traverse different flip gates, so both are
-                   proven — a mismatch between the two shows up as one branch
-                   upright and the other mirrored, which is precisely the
-                   "some cameras look flipped and others don't" report. */
-                Debug.Log("[Kerbcast-CI] --- shipped chain (blit + CaptureCore correction) ---");
-                CheckBranch("plain+capture", (s, d) => Graphics.Blit(s, d), src, failures,
-                    captureTail: true);
+                /* NO shipped-chain branch here, deliberately. Appending
+                   CaptureOrientation's correction and reading the result back
+                   would measure a pipeline that does not exist: production
+                   reads back through the OpenGL shim, which returns the frame
+                   inverted on bottom-left-origin APIs — that inversion is the
+                   whole reason the correction exists — while this project only
+                   has Unity's native AsyncGPUReadback, which does not invert.
+                   Shim + correction is upright; native + correction is flipped,
+                   so the branch failed with vflip against a pipeline measured
+                   correct on real hardware. The shim cannot be added here (it is
+                   also why CaptureCore itself cannot be symlinked in).
 
-                Material nv2 = LoadNightVisionMaterial();
-                nv2.SetFloat("_Gain", 4f);
-                try
-                {
-                    CheckBranch("nightvision+capture", (s, d) => Graphics.Blit(s, d, nv2), src,
-                        failures, captureTail: true);
-                }
-                finally
-                {
-                    UnityEngine.Object.DestroyImmediate(nv2);
-                }
-
-                CheckFilterBranch("filter-probe+capture", src, failures, captureTail: true);
+                   The shipped chain IS covered, on the device where it runs:
+                   live_tests/orientation-check.py drives a marker through the
+                   real filter, blit, correction and ring write, and classifies
+                   the delivered frame. This harness proves the blit branches;
+                   that one proves the whole path. */
             }
             finally
             {
