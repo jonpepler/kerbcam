@@ -394,8 +394,13 @@ jobs:
           VER="$(apt-cache madison unityhub | awk '{print $3}' | grep -v '^3\.20' | head -1)"
           echo "pinning unityhub ${VER:-<none found, using latest>}"
           if [ -n "$VER" ]; then
+            # An apt PIN, not apt-mark hold: the setup action runs its own
+            # `apt-get install unityhub`, and a hold makes that fail with
+            # exit 100. A pin keeps the version fixed while letting the
+            # action's install succeed against it.
+            printf 'Package: unityhub\nPin: version %s\nPin-Priority: 1001\n' "$VER" \
+              | sudo tee /etc/apt/preferences.d/unityhub >/dev/null
             sudo apt-get install -y "unityhub=$VER"
-            sudo apt-mark hold unityhub
           else
             sudo apt-get install -y unityhub
           fi
@@ -558,8 +563,13 @@ jobs:
           VER="$(apt-cache madison unityhub | awk '{print $3}' | grep -v '^3\.20' | head -1)"
           echo "pinning unityhub ${VER:-<none found, using latest>}"
           if [ -n "$VER" ]; then
+            # An apt PIN, not apt-mark hold: the setup action runs its own
+            # `apt-get install unityhub`, and a hold makes that fail with
+            # exit 100. A pin keeps the version fixed while letting the
+            # action's install succeed against it.
+            printf 'Package: unityhub\nPin: version %s\nPin-Priority: 1001\n' "$VER" \
+              | sudo tee /etc/apt/preferences.d/unityhub >/dev/null
             sudo apt-get install -y "unityhub=$VER"
-            sudo apt-mark hold unityhub
           else
             sudo apt-get install -y unityhub
           fi
