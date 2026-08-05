@@ -10,7 +10,7 @@ namespace Kerbcast
         Vessel Vessel { get; }
         bool IsAlive { get; }
         bool Subscribed { get; }
-        /* Background-hum pacing. The core asks each subscribed camera what rate
+        /* Background-background capture pacing. The core asks each subscribed camera what rate
            it should run at and whether it is due this tick, then staggers only
            the cameras that are. See CapturePacing for why eligibility rather
            than a second budget. */

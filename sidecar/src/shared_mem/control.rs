@@ -51,8 +51,8 @@
 //!                                mode. Append -> no version bump.)
 //!   +64  4   f32 capture_fps    (requested capture rate. Present-bit CLEAR =
 //!                                capture at the primary rate, which is what a
-//!                                pre-hum sidecar writes. A low value is a
-//!                                background hum. Append -> no version bump.)
+//!                                sidecar predating background capture writes. A low value is a
+//!                                background background capture. Append -> no version bump.)
 //! ```
 //!
 //! NOTE: this field is an APPEND with its own `fields_present` bit, NOT a layout
@@ -119,8 +119,8 @@ const B_TRACK_MODE: usize = 56;
 const B_TRACK_SEQ: usize = 60;
 // capture_fps (+64): the rate the plugin should capture this camera at, in
 // frames per second. Present-bit gated: clear = capture at the primary rate,
-// which is what a pre-hum sidecar writes and what the plugin already did. A low
-// value is a background "hum" — subscribed, but paced far below primary because
+// which is what a sidecar predating background capture writes and what the plugin already did. A low
+// value is a background "background capture" — subscribed, but paced far below primary because
 // nothing is displaying it at size. Appended within the reserved body, so the
 // golden fixture stays byte-identical and old/new builds interoperate.
 const B_CAPTURE_FPS: usize = 64;
@@ -504,12 +504,12 @@ mod tests {
         assert_eq!(snap.capture_fps, None);
         assert_eq!(snap.fields_present & FP_CAPTURE_FPS, 0);
 
-        // A hum rate round-trips.
-        let humming = ControlState {
+        // Background capture rate round-trips.
+        let background_capturing = ControlState {
             capture_fps: Some(1.5),
             ..fixture_state()
         };
-        let snap = decode(&write_to_vec(&humming)).expect("decodes");
+        let snap = decode(&write_to_vec(&background_capturing)).expect("decodes");
         assert_eq!(snap.capture_fps, Some(1.5));
         assert_ne!(snap.fields_present & FP_CAPTURE_FPS, 0);
 

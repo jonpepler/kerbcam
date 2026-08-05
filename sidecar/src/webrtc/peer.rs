@@ -622,12 +622,12 @@ async fn handle_client_message(
                 .set_forced_full_res(flight_id, peer_id, force)
                 .await;
         }
-        // Background capture ("hum"): this consumer asking that cameras it
+        // Background capture ("background capture"): this consumer asking that cameras it
         // isn't displaying keep ticking over instead of stopping. Per-peer and
         // MAX-aggregated; forgotten on disconnect / peer reap so a departed
-        // consumer can't pin the hum on with nobody watching.
+        // consumer can't pin background capture on with nobody watching.
         ClientMessage::SetBackgroundCaptureFps(SetBackgroundCaptureFpsPayload { fps }) => {
-            if registry.set_hum_request(peer_id, fps).await {
+            if registry.set_background_request(peer_id, fps).await {
                 // The aggregate moved, so every camera's requested rate has to
                 // be recomputed and pushed down to the plugin.
                 registry.reflush_all_capture_rates().await;
@@ -649,10 +649,10 @@ async fn handle_client_message(
             // Same peer-scoped sweep for any force this peer held, so a feed
             // never stays pinned at the ceiling after its forcer leaves.
             registry.forget_forced_all(peer_id).await;
-            // And the hum request, or a departed consumer keeps background
+            // And background capture request, or a departed consumer keeps background
             // capture running for the rest of the session with nobody watching
             // — the v1.6.3 pin-high class again.
-            if registry.forget_hum_request(peer_id).await {
+            if registry.forget_background_request(peer_id).await {
                 registry.reflush_all_capture_rates().await;
             }
         }

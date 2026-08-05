@@ -1,13 +1,13 @@
-// Unit tests for CapturePacing — the background-"hum" capture-rate decisions.
+// Unit tests for CapturePacing — the background-"background capture" capture-rate decisions.
 //
-// What these guard: the hum keeps a subscribed-but-undisplayed camera ticking
+// What these guard: background capture keeps a subscribed-but-undisplayed camera ticking
 // over slowly so switching to it promotes an already-flowing stream instead of
 // cold-starting from black. The load-bearing property is that pacing is
-// expressed as ELIGIBILITY — a hum camera joins a tick's capture set only when
+// expressed as ELIGIBILITY — a background camera joins a tick's capture set only when
 // its interval is due — so it draws stagger permits in proportion to its rate
 // rather than competing head-on with the feed being watched.
 //
-// The regression that matters most: with the hum OFF (the default), behaviour
+// The regression that matters most: with background capture OFF (the default), behaviour
 // must be byte-for-byte what it always was. Every subscribed camera eligible
 // every tick, no exceptions, whatever the sidecar asks for.
 //
@@ -32,18 +32,18 @@ const float Primary = 30f;
     Check(p.Due(0f, Primary, Primary), "no request -> due immediately");
     p.MarkGranted(0f);
     Check(p.Due(0.001f, Primary, Primary), "primary stays due every tick");
-    Check(!p.IsHumming(Primary, Primary), "primary is not humming");
+    Check(!p.IsBackground(Primary, Primary), "primary is not capturing in the background");
 }
 
 // --- 2. Hum off (ceiling 0) refuses every request. The default must be free. ---
 {
     var p = new CapturePacing { RequestedFps = 1f };
-    Check(p.Effective(Primary, 0f) == 0f, "ceiling 0 -> effective 0 (hum disabled)");
+    Check(p.Effective(Primary, 0f) == 0f, "ceiling 0 -> effective 0 (background capture disabled)");
     Check(!p.Due(0f, 0f, Primary), "effective 0 -> never due");
-    Check(!p.IsHumming(0f, Primary), "not capturing is not humming");
+    Check(!p.IsBackground(0f, Primary), "not capturing is not capturing in the background");
 }
 
-// --- 3. A hum request is clamped by the operator ceiling. ---
+// --- 3. A background request is clamped by the operator ceiling. ---
 {
     var p = new CapturePacing { RequestedFps = 10f };
     Check(p.Effective(Primary, 2f) == 2f, "request above ceiling clamps to ceiling");
@@ -52,7 +52,7 @@ const float Primary = 30f;
     Check(q.Effective(Primary, 5f) == 1f, "request below ceiling is honoured as-is");
 }
 
-// --- 4. The hum can slow a camera, never speed it past primary. ---
+// --- 4. Background capture can slow a camera, never speed it past primary. ---
 {
     var p = new CapturePacing { RequestedFps = 120f };
     Check(p.Effective(Primary, 60f) == Primary, "request above primary clamps to primary");
@@ -60,11 +60,11 @@ const float Primary = 30f;
     Check(q.Effective(Primary, 60f) == Primary, "request equal to primary is primary");
 }
 
-// --- 5. Pacing: a 1fps hum is due about once a second, not every tick. ---
+// --- 5. Pacing: a 1fps background capture is due about once a second, not every tick. ---
 {
     var p = new CapturePacing { RequestedFps = 1f };
     float eff = p.Effective(Primary, 5f);
-    Check(eff == 1f, "1fps hum honoured under a 5fps ceiling");
+    Check(eff == 1f, "1fps background capture honoured under a 5fps ceiling");
 
     Check(p.Due(100f, eff, Primary), "first capture is due immediately");
     p.MarkGranted(100f);
@@ -73,7 +73,7 @@ const float Primary = 30f;
 }
 
 // --- 6. Proportional weight: the whole point of eligibility-based pacing.
-//        A 1fps hum among 30fps ticks should ask for ~1 slot in 30. ---
+//        A 1fps background capture among 30fps ticks should ask for ~1 slot in 30. ---
 {
     var p = new CapturePacing { RequestedFps = 1f };
     float eff = p.Effective(Primary, 5f);
@@ -84,11 +84,11 @@ const float Primary = 30f;
         if (p.Due(now, eff, Primary)) { due++; p.MarkGranted(now); }
     }
     // 10 seconds at 1fps: 10 captures, plus the immediate first one.
-    Check(due >= 9 && due <= 11, $"1fps hum due ~10x over 10s at 30fps (got {due})");
+    Check(due >= 9 && due <= 11, $"1fps background capture due ~10x over 10s at 30fps (got {due})");
 }
 
 // --- 7. A granted capture, not mere eligibility, restarts the interval. So a
-//        hum camera that loses the round-robin stays due rather than silently
+//        background camera that loses the round-robin stays due rather than silently
 //        skipping a whole interval. ---
 {
     var p = new CapturePacing { RequestedFps = 1f };
@@ -110,12 +110,12 @@ const float Primary = 30f;
     Check(p.Due(1000.1f, eff, Primary), "reset -> due immediately (resubscribe)");
 }
 
-// --- 9. IsHumming only when genuinely between off and primary. ---
+// --- 9. IsBackground only when genuinely between off and primary. ---
 {
     var p = new CapturePacing();
-    Check(p.IsHumming(1f, Primary), "1fps of 30 is humming");
-    Check(!p.IsHumming(Primary, Primary), "primary is not humming");
-    Check(!p.IsHumming(0f, Primary), "off is not humming");
+    Check(p.IsBackground(1f, Primary), "1fps of 30 is capturing in the background");
+    Check(!p.IsBackground(Primary, Primary), "primary is not capturing in the background");
+    Check(!p.IsBackground(0f, Primary), "off is not capturing in the background");
 }
 
 Console.WriteLine(failures == 0 ? "\nALL CAPTURE-PACING CHECKS PASSED" : $"\n{failures} CHECK(S) FAILED");

@@ -110,7 +110,7 @@ pub enum CameraLifecycle {
 /// `CameraState` so a consumer renders what is actually happening rather than
 /// predicting it from delay arithmetic.
 ///
-/// `Hum` and `Off` only occur when background capture is enabled; with it off
+/// `Background` and `Off` only occur when background capture is enabled; with it off
 /// (the default) a subscribed camera is `Full` and an unsubscribed one is `Off`,
 /// which is exactly today's behaviour under the new names.
 #[typeshare]
@@ -125,7 +125,7 @@ pub enum CaptureState {
     Ramping,
     /// Background capture: recent but sparse. A consumer should present this as
     /// a reduced-rate channel, not as a live feed.
-    Hum,
+    Background,
     /// Not being captured at all — unsubscribed, or the background layer has
     /// been shed under load. A consumer must NOT keep presenting the last frame
     /// as though it were a live low-rate channel.
@@ -179,7 +179,7 @@ pub struct CameraState {
     #[serde(default)]
     pub kind: CameraKind,
     /// How hard this camera is currently being captured. Defaults to `Full` so
-    /// existing payloads and pre-hum plugins are unaffected.
+    /// existing payloads and plugins predating background capture are unaffected.
     #[serde(default)]
     pub capture_state: CaptureState,
     /// The kerbal's real `ProtoCrewMember.persistentID`: the stable key a
@@ -305,7 +305,7 @@ pub struct SetForceFullResolutionPayload {
     pub force: bool,
 }
 
-/// Consumer's background-capture ("hum") request. Global rather than
+/// Consumer's background-capture request. Global rather than
 /// per-camera: it is a statement about how much background cost this consumer
 /// wants spent, not about one camera. Zero stops asking.
 #[typeshare]
@@ -592,16 +592,16 @@ pub enum ClientMessage {
     /// yields to the adaptive framerate shed; overrides only the demand
     /// term, never the perf-protection ceiling.
     SetForceFullResolution(SetForceFullResolutionPayload),
-    /// Ask for background capture (the "hum"): subscribed cameras that this
+    /// Ask for background capture: subscribed cameras that this
     /// consumer is NOT displaying keep capturing at a low rate instead of
     /// stopping, so switching to one promotes an already-flowing stream rather
     /// than cold-starting from black.
     ///
-    /// Per-consumer and MAX-aggregated, like `ReportDisplaySize`: the hum runs
+    /// Per-consumer and MAX-aggregated, like `ReportDisplaySize`: it runs
     /// at the highest rate any connected consumer asked for, and relaxes when
     /// they lower it or disconnect. A consumer that never sends this pays
     /// nothing, which is why a stock install needs no configuration to serve
-    /// both a plain viewer and a consumer that wants the hum.
+    /// both a plain viewer and a consumer that wants background capture.
     ///
     /// The rate is a REQUEST, not a guarantee. It is clamped to the operator's
     /// `BackgroundCaptureFps` ceiling and is the first thing dropped when the
@@ -609,7 +609,7 @@ pub enum ClientMessage {
     /// for what is actually happening. Send 0 to stop asking.
     ///
     /// Receiving the frames is not the same as keeping them: a consumer that
-    /// wants history for a camera it isn't showing has to buffer the humming
+    /// wants history for a camera it isn't showing has to buffer the background
     /// feed itself.
     SetBackgroundCaptureFps(SetBackgroundCaptureFpsPayload),
     /// Set the camera's field-of-view (degrees). Silently ignored for

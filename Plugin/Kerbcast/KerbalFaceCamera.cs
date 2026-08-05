@@ -139,7 +139,7 @@ namespace Kerbcast
         // flag. Idle (unsubscribed) kerbal cameras do no render/readback work.
         public bool Subscribed => _subscribed;
 
-        /* Background-hum pacing, same seam and same shared logic as part
+        /* Background-background capture pacing, same seam and same shared logic as part
            cameras: a crew face nobody is displaying at size still ticks over so
            switching to it doesn't cold-start. */
         private CapturePacing _pacing;

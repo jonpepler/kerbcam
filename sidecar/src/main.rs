@@ -316,12 +316,12 @@ async fn consume_loop(
             // Status poll piggybacks on the rescan cadence — both are
             // ~1Hz and the plugin's status writer matches that rate.
             let delta = registry.poll_status().await;
-            /* The hum ceiling moved (operator change, or the plugin shedding /
+            /* Background capture ceiling moved (operator change, or the plugin shedding /
             restoring the background rung), so every camera's requested
             capture rate has to be recomputed and pushed back down. Done
             before the broadcast so a peer's next state read is consistent
             with what the plugin was just told. */
-            if delta.hum_ceiling_changed {
+            if delta.background_ceiling_changed {
                 registry.reflush_all_capture_rates().await;
             }
             if delta.adaptive_shed.is_some()
@@ -426,9 +426,9 @@ async fn consume_loop(
             // Same peer-scoped sweep for any force this peer held, so a feed
             // never stays pinned at the ceiling after a dead-peer reap.
             registry.forget_forced_all(peer.peer_id).await;
-            // Same for the hum request: a dead peer must not leave background
+            // Same for background capture request: a dead peer must not leave background
             // capture pinned on (the v1.6.3 pin-high class).
-            if registry.forget_hum_request(peer.peer_id).await {
+            if registry.forget_background_request(peer.peer_id).await {
                 registry.reflush_all_capture_rates().await;
             }
         }

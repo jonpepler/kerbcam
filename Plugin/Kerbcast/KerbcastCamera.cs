@@ -214,7 +214,7 @@ namespace Kerbcast
         /// and must not consume capture permits.</summary>
         public bool Subscribed => _subscribed;
 
-        /* Background "hum" pacing: a subscribed camera nothing is displaying at
+        /* Background "background capture" pacing: a subscribed camera nothing is displaying at
            size still ticks over at a reduced rate, so switching to it promotes
            an already-flowing stream. Decision logic lives in CapturePacing so
            it is unit-testable without Unity. */
@@ -1502,7 +1502,7 @@ namespace Kerbcast
                 }
 
                 /* Requested capture rate. Absent = capture at the primary rate,
-                   which is what a pre-hum sidecar writes, so an old sidecar and
+                   which is what a predating background capture sidecar writes, so an old sidecar and
                    a new plugin behave exactly as before. */
                 _pacing.RequestedFps = snap.CaptureFps;
 

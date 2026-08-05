@@ -93,8 +93,8 @@ namespace Kerbcast
         /// Always read (fixed field), like PanSeq/FovSeq.</summary>
         public uint TrackSeq;
         /// <summary>Requested capture rate in frames per second. Null = capture
-        /// at the primary rate (today's behaviour, and what a pre-hum sidecar
-        /// leaves clear). A low value is a background "hum": the camera stays
+        /// at the primary rate (today's behaviour, and what a predating background capture sidecar
+        /// leaves clear). A low value is a background capture: the camera stays
         /// subscribed but is paced far below the primary rate because nothing
         /// is displaying it at size.</summary>
         public float? CaptureFps;
@@ -137,7 +137,7 @@ namespace Kerbcast
         private const int BTrackSeq = HeaderSize + 60;
         // Another APPEND, same forward-compatible rules as track_mode above: an
         // old reader ignores the bit and never touches +64, so the golden
-        // fixture stays byte-identical and a pre-hum sidecar interoperates.
+        // fixture stays byte-identical and a predating background capture sidecar interoperates.
         private const int BCaptureFps = HeaderSize + 64;
 
         // fields_present bits — one per Option/Vec field.

@@ -254,7 +254,7 @@ mod tests {
         assert!(matches!(err, EncodeError::Invalid(_)));
     }
 
-    /// `Nal::is_keyframe` must actually recognise a real encoder's IDR. The hum
+    /// `Nal::is_keyframe` must actually recognise a real encoder's IDR. Background capture
     /// promotion path depends on it: a promoted camera is published as
     /// `Ramping` until an IDR is seen in the output, so if this detection is
     /// wrong the camera never reports `Full` and a consumer's overlay sticks

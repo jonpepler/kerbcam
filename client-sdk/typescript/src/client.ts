@@ -1128,26 +1128,28 @@ export class KerbcastClient extends TypedEmitter<KerbcastClientEvents> {
   }
 
   /**
-   * Ask for background capture (the "hum"): subscribed cameras this consumer is
-   * NOT displaying keep capturing at a low rate instead of stopping, so
-   * switching to one promotes an already-flowing stream rather than
-   * cold-starting from black.
+   * Ask for background capture: subscribed cameras this consumer is NOT
+   * displaying keep capturing at a low rate instead of stopping, so switching
+   * to one promotes an already-flowing stream rather than cold-starting from
+   * black.
    *
    * Opt-in and per-consumer, aggregated MAX-across-consumers. A consumer that
    * never calls this pays nothing, which is why the same kerbcast install
-   * serves both a plain viewer and a consumer that wants the hum with no
-   * configuration either side. Pass 0 to stop asking; the request is dropped
-   * automatically on disconnect.
+   * serves both a plain viewer and a consumer that wants background capture
+   * with no configuration either side. Pass 0 to stop asking; the request is
+   * dropped automatically on disconnect.
    *
    * The rate is a REQUEST, not a guarantee: it is capped by the operator's
    * `BackgroundCaptureFps` ceiling and is the first thing dropped as the game
    * approaches its framerate floor. Read `CameraState.captureState` for what is
-   * actually happening rather than assuming this took effect.
+   * actually happening rather than assuming this took effect — it reports
+   * `Background` only while the reduced rate is genuinely running, and `Off`
+   * once the layer has been shed.
    *
-   * Receiving humming frames is not the same as keeping them. A consumer that
-   * wants *history* for a camera it isn't showing — to render instantly on
+   * Receiving background frames is not the same as keeping them. A consumer
+   * that wants *history* for a camera it isn't showing — to render instantly on
    * switch under a simulated signal delay, say — has to buffer those feeds
-   * itself; the hum only makes the frames available to buffer.
+   * itself; background capture only makes the frames available to buffer.
    */
   async setBackgroundCaptureFps(fps: number): Promise<void> {
     await this._send({ type: "set-background-capture-fps", content: { fps } });

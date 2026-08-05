@@ -113,25 +113,25 @@ namespace Kerbcast
         // (no evaluation, no ApplyAutoShed calls, shedLevel always 0).
         private AdaptiveQualityController _qualityController;
 
-        /* Background-hum rung: the FIRST thing shed under load, before the
+        /* Background-background capture rung: the FIRST thing shed under load, before the
            stagger regulator starts starving primaries and long before the
            quality ladder demotes them. Thresholds sit ABOVE the MinKspFps
            physics floor (18 by default) precisely so this reacts first — by the
-           time the game is near the floor the hum is already gone.
+           time the game is near the floor background capture is already gone.
 
            A ShedController instance rather than a second anti-flap machine: the
            dwell, the asymmetric fast-attack/slow-release and the adaptive
            restore back-off are exactly the contract this needs, and that
            contract exists because a captured Deck session once flapped 638
            resolution changes. Not worth re-deriving. */
-        private ShedController _humShed;
-        private int _humShedLevel;
+        private ShedController _backgroundShed;
+        private int _backgroundShedLevel;
         /// <summary>Hum ceiling computed once per tick. Cached because reading it
         /// must not re-run the shed controller — Evaluate advances dwell state,
         /// so calling it twice a frame would corrupt the anti-flap timing.</summary>
-        private float _effectiveHumCeiling;
+        private float _effectiveBackgroundCeiling;
         /// <summary>Fraction of the operator's BackgroundCaptureFps still
-        /// allowed at each hum-shed level. Level 2 is the hum fully off.</summary>
+        /// allowed at each background-shed level. Level 2 is background capture fully off.</summary>
         private static readonly float[] HumCeilingScale = { 1f, 0.5f, 0f };
         // Cameras that actually captured last frame, for the per-camera cost
         // estimate (kerbcastFrameMs / captured).
@@ -201,14 +201,14 @@ namespace Kerbcast
             };
             _staggerController = BuildStaggerController(_settings);
             /* Only built when the operator permits background capture at all:
-               with the ceiling at 0 nothing can ever hum, so there is nothing to
+               with the ceiling at 0 nothing can ever background capture, so there is nothing to
                shed and the ladder keeps exactly its old shape. Thresholds sit
-               well above MinKspFps so the hum is gone before the primary
-               machinery reacts. Permitting is not enabling — a camera only hums
+               well above MinKspFps so background capture is gone before the primary
+               machinery reacts. Permitting is not enabling — a camera only captures in the background
                once a connected client asks for it. */
             if (_settings.BackgroundCaptureFps > 0f)
             {
-                _humShed = new ShedController(
+                _backgroundShed = new ShedController(
                     maxLevel: 2,
                     shedBelow: new[] { 24f, 20f },
                     restoreAbove: new[] { 28f, 24f });
@@ -532,21 +532,21 @@ namespace Kerbcast
                 if (_subscribedIdx.Length < n) _subscribedIdx = new int[n];
                 _streamCount = 0;
                 /* The set is the cameras ELIGIBLE to capture this tick, not
-                   simply the subscribed ones. A camera humming in the background
+                   simply the subscribed ones. A camera capturing in the background in the background
                    is subscribed but only becomes eligible once its interval has
                    elapsed, so it draws stagger permits in proportion to its rate
                    instead of competing head-on with the feed being watched. With
-                   the hum off (the default) every subscribed camera is eligible
+                   background capture off (the default) every subscribed camera is eligible
                    every tick and this is exactly the old set. */
                 float primaryFps = _settings.MaxCaptureFps;
-                _effectiveHumCeiling = EffectiveHumCeiling();
-                float humCeiling = _effectiveHumCeiling;
+                _effectiveBackgroundCeiling = EffectiveHumCeiling();
+                float backgroundCeiling = _effectiveBackgroundCeiling;
                 float now = Time.unscaledTime;
                 for (int i = 0; i < n; i++)
                 {
                     var cam = _cameras[i];
                     if (!cam.Subscribed) continue;
-                    float eff = cam.EffectiveCaptureFps(primaryFps, humCeiling);
+                    float eff = cam.EffectiveCaptureFps(primaryFps, backgroundCeiling);
                     if (!cam.CaptureDue(now, eff, primaryFps)) continue;
                     _subscribedIdx[_streamCount++] = i;
                 }
@@ -623,7 +623,7 @@ namespace Kerbcast
             // _lastCapturedCount honest).
             for (int i = 0; i < camCount; i++) _capturePermit[i] = false;
             {
-                /* Stamp the grant, not the eligibility: a hum camera that was due
+                /* Stamp the grant, not the eligibility: a background camera that was due
                    but lost the round-robin keeps its old timestamp and stays due,
                    so a busy tick delays it rather than silently skipping a whole
                    interval. */
@@ -955,13 +955,13 @@ namespace Kerbcast
                 // flag-off output stays byte-identical to the pre-flag plugin).
                 sb.Append($"  \"shedLevel\": {(_qualityController != null ? _qualityController.Level : 0)},\n");
                 sb.Append($"  \"throttleMainScreen\": {(_throttleEffective ? "true" : "false")},\n");
-                /* Background-hum ceiling actually in force: the operator's
-                   setting after the hum shed rung. The sidecar reads this to
+                /* Background-background ceiling actually in force: the operator's
+                   setting after background capture shed rung. The sidecar reads this to
                    know what rate to ask undisplayed cameras for — the plugin
                    stays the single authority on the number, the sidecar only
-                   knows which cameras nobody is displaying. 0 = hum off, which
+                   knows which cameras nobody is displaying. 0 = background capture off, which
                    is the default and makes this whole path inert. */
-                sb.Append($"  \"backgroundCaptureFps\": {_effectiveHumCeiling.ToString("F2", System.Globalization.CultureInfo.InvariantCulture)},\n");
+                sb.Append($"  \"backgroundCaptureFps\": {_effectiveBackgroundCeiling.ToString("F2", System.Globalization.CultureInfo.InvariantCulture)},\n");
                 /* Mission-time capture clock: KSP universal time (seconds) and
                    the current time-warp multiplier at write time, plus the
                    discontinuity epoch. Round-trip ("R") + InvariantCulture so
@@ -1208,21 +1208,21 @@ namespace Kerbcast
         // Skips until the fps window has filled — early post-load frames noisy.
         /// <summary>
         /// The background-capture ceiling actually in force this tick: the
-        /// operator's setting reduced by the hum shed rung. Zero once the rung
-        /// is fully shed, which makes every hum camera ineligible, shrinks the
+        /// operator's setting reduced by background capture shed rung. Zero once the rung
+        /// is fully shed, which makes every background camera ineligible, shrinks the
         /// eligible set back to the primaries, and so relieves the pressure
         /// BEFORE the stagger regulator or the quality ladder touch a feed
         /// anyone is watching.
         /// </summary>
         private float EffectiveHumCeiling()
         {
-            if (_humShed == null) return 0f; // hum disabled: nothing to allow
+            if (_backgroundShed == null) return 0f; // background capture disabled: nothing to allow
             /* Skip until the fps window has filled, same guard the other
                controllers use — early post-load frames are too noisy to act on,
-               and acting on them would shed a hum that was never in trouble. */
+               and acting on them would shed a background capture that was never in trouble. */
             if (_fpsCount < FpsSamples) return _settings.BackgroundCaptureFps;
-            _humShedLevel = _humShed.Evaluate(_fpsAvg, Time.unscaledTime);
-            int idx = _humShedLevel;
+            _backgroundShedLevel = _backgroundShed.Evaluate(_fpsAvg, Time.unscaledTime);
+            int idx = _backgroundShedLevel;
             if (idx < 0) idx = 0;
             if (idx >= HumCeilingScale.Length) idx = HumCeilingScale.Length - 1;
             return _settings.BackgroundCaptureFps * HumCeilingScale[idx];

@@ -102,13 +102,13 @@ namespace Kerbcast
         // still applies).
         public float MaxCaptureFps { get; private set; } = 30f;
 
-        // CEILING for the background "hum": how fast a SUBSCRIBED camera that
+        // CEILING for background capture: how fast a SUBSCRIBED camera that
         // nothing is displaying at size may keep capturing, so switching to it
         // promotes an already-flowing stream instead of cold-starting from black.
         //
-        // This is a cap, NOT a switch. Nothing hums unless a connected client
+        // This is a cap, NOT a switch. Nothing captures in the background unless a connected client
         // asks for it (SetBackgroundCaptureFps), so the default costs a plain
-        // viewer nothing while still letting a client that wants the hum have it
+        // viewer nothing while still letting a client that wants background capture have it
         // with no config edit. Set 0 to forbid background capture outright
         // however loudly a client asks; raise it toward MaxCaptureFps on a
         // machine with headroom.
@@ -116,7 +116,7 @@ namespace Kerbcast
         // Cost scales with the rate, not the resolution: a camera is four
         // camera.Render() calls dominated by culling + draw calls, which barely
         // care about pixel count but scale directly with how often you run them.
-        // Effective rate is min(what clients asked for, this), and the hum is
+        // Effective rate is min(what clients asked for, this), and background capture is
         // shed BEFORE any primary-stream degradation as the game approaches
         // MinKspFps.
         public float BackgroundCaptureFps { get; private set; } = 2f;
