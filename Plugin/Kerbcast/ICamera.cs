@@ -10,13 +10,15 @@ namespace Kerbcast
         Vessel Vessel { get; }
         bool IsAlive { get; }
         bool Subscribed { get; }
-        /* Background-background capture pacing. The core asks each subscribed camera what rate
-           it should run at and whether it is due this tick, then staggers only
-           the cameras that are. See CapturePacing for why eligibility rather
-           than a second budget. */
+        /* Capture-rate pacing. The core asks each subscribed camera what rate it
+           should run at and whether it is due this tick, then staggers only the
+           cameras that are, and tells the ones it granted at what rate. This is
+           where the rate cap lives; see CapturePacing for why it cannot live in
+           the stagger budget. */
         float EffectiveCaptureFps(float primaryFps, float backgroundCeilingFps);
-        bool CaptureDue(float now, float effectiveFps, float primaryFps);
-        void MarkCaptureGranted(float now);
+        bool CaptureDue(float now, float effectiveFps);
+        float CaptureOverdue(float now, float effectiveFps);
+        void MarkCaptureGranted(float now, float effectiveFps);
         int RefreshFailureStreak { get; set; }
         bool OwnsPart(Part part);
         void MarkFxDirty();

@@ -152,17 +152,28 @@ namespace Kerbcast
         // render thread on any leftover readback tasks until KSP is restarted.
         private GameObject _readbackUpdaterGo;
 
-        // Round-robins which cameras capture each frame (see ReadbackScheduler),
-        // so they don't all issue a GPU render + readback on the same frame.
-        private readonly ReadbackScheduler _readbackScheduler = new ReadbackScheduler();
+        // Bounds how many cameras capture each frame (see ReadbackScheduler), so
+        // they don't all issue a GPU render + readback on the same frame.
         private bool[] _capturePermit = new bool[0];
         // Staggering is budgeted over the SUBSCRIBED (streaming) cameras only —
         // idle/attached cameras cost nothing and must not consume permits.
-        // _subscribedIdx[0.._streamCount) maps a round-robin rank to a full
-        // _cameras index; _streamPermit is the rank-indexed permit set.
+        // _subscribedIdx[0.._streamCount) maps a rank to a full _cameras index,
+        // ordered most-overdue-first so the scheduler can grant the front of it;
+        // _streamPermit is the rank-indexed permit set, _streamEff the rank-indexed
+        // capture rate a grant is stamped at, _streamOverdue the sort key.
         private int[] _subscribedIdx = new int[0];
         private bool[] _streamPermit = new bool[0];
+        private float[] _streamEff = new float[0];
+        private float[] _streamOverdue = new float[0];
         private int _streamCount;
+        /* Cameras capturing at all, due this tick or not. _streamCount is only
+           the ones ELIGIBLE this tick, and now that every camera is paced (not
+           just background ones) that number dips below the streaming count on
+           most ticks. Anything that means "how many cameras are streaming" wants
+           this instead: the per-tick concurrency budget, and the two controllers
+           that treat the count as their budget ceiling and would otherwise
+           ratchet themselves down to the smallest momentary dip. */
+        private int _streamSubscribedCount;
 
         // Telemetry (Recommendation 1): GC collection-count tracker. Sampled
         // once per LateUpdate when KerbcastSettings.EnableTelemetry is true,
@@ -530,14 +541,16 @@ namespace Kerbcast
             {
                 int n = _cameras.Count;
                 if (_subscribedIdx.Length < n) _subscribedIdx = new int[n];
+                if (_streamEff.Length < n) _streamEff = new float[n];
+                if (_streamOverdue.Length < n) _streamOverdue = new float[n];
                 _streamCount = 0;
+                _streamSubscribedCount = 0;
                 /* The set is the cameras ELIGIBLE to capture this tick, not
-                   simply the subscribed ones. A camera capturing in the background in the background
-                   is subscribed but only becomes eligible once its interval has
-                   elapsed, so it draws stagger permits in proportion to its rate
-                   instead of competing head-on with the feed being watched. With
-                   background capture off (the default) every subscribed camera is eligible
-                   every tick and this is exactly the old set. */
+                   simply the subscribed ones. Every camera only becomes eligible
+                   once its own interval has elapsed, so each draws stagger
+                   permits in proportion to its rate: that is what caps the rate,
+                   and it is what stops a camera in background capture from
+                   competing head-on with the feed being watched. */
                 float primaryFps = _settings.MaxCaptureFps;
                 _effectiveBackgroundCeiling = EffectiveHumCeiling();
                 float backgroundCeiling = _effectiveBackgroundCeiling;
@@ -547,8 +560,27 @@ namespace Kerbcast
                     var cam = _cameras[i];
                     if (!cam.Subscribed) continue;
                     float eff = cam.EffectiveCaptureFps(primaryFps, backgroundCeiling);
-                    if (!cam.CaptureDue(now, eff, primaryFps)) continue;
-                    _subscribedIdx[_streamCount++] = i;
+                    if (eff <= 0f) continue;
+                    _streamSubscribedCount++;
+                    if (!cam.CaptureDue(now, eff)) continue;
+                    /* Ordered most-overdue-first, because when more cameras come
+                       due than the frame's concurrency bound allows the scheduler
+                       grants the front of this list, and the camera furthest behind
+                       has to be there. Insertion sort: a handful of entries, and no
+                       allocation on the main thread. */
+                    float overdue = cam.CaptureOverdue(now, eff);
+                    int at = _streamCount;
+                    while (at > 0 && _streamOverdue[at - 1] < overdue)
+                    {
+                        _streamOverdue[at] = _streamOverdue[at - 1];
+                        _subscribedIdx[at] = _subscribedIdx[at - 1];
+                        _streamEff[at] = _streamEff[at - 1];
+                        at--;
+                    }
+                    _streamOverdue[at] = overdue;
+                    _subscribedIdx[at] = i;
+                    _streamEff[at] = eff;
+                    _streamCount++;
                 }
             }
 
@@ -594,28 +626,44 @@ namespace Kerbcast
                 }
             }
 
-            // Stagger captures round-robin so the cameras don't all render +
-            // read back on the same frame. Budget = how many may capture this
-            // frame to sustain MaxCaptureFps at the current game fps (_fpsAvg);
-            // below MaxCaptureFps it grants all of them.
+            // Stagger captures so the cameras don't all render +
+            // read back on the same frame. Budget = how many captures per frame
+            // the whole streaming set needs to sustain MaxCaptureFps at the
+            // current game fps (_fpsAvg); below MaxCaptureFps it grants all of
+            // them. This bounds CONCURRENCY only. The rate cap is each camera's
+            // own interval (CapturePacing), so a tick where more cameras come due
+            // than the budget allows delays the extras by a frame rather than
+            // speeding anyone up.
             int camCount = _cameras.Count;
             if (_capturePermit.Length < camCount) _capturePermit = new bool[camCount];
             if (_subscribedIdx.Length < camCount) _subscribedIdx = new int[camCount];
             if (_streamPermit.Length < camCount) _streamPermit = new bool[camCount];
+            if (_streamEff.Length < camCount) _streamEff = new float[camCount];
+            if (_streamOverdue.Length < camCount) _streamOverdue = new float[camCount];
 
             // Staggering is budgeted over the SUBSCRIBED set only. Idle cameras
             // cost nothing (Refresh early-outs on !_subscribed) and must not eat
             // permits — otherwise the few cameras actually streaming would be
-            // staggered as if among all attached. (_streamCount was filled before
-            // UpdateDegradeLevel so the controller saw the same count.)
-            int budget = _streamCount; // safe default if controller not built
-            if (_streamCount > 0)
+            // staggered as if among all attached. (Both counts were filled before
+            // UpdateDegradeLevel so the controllers saw the same numbers.)
+            int budget = _streamSubscribedCount; // safe default if controller not built
+            if (_streamSubscribedCount > 0)
             {
-                int rateBudget = ReadbackScheduler.Budget(_streamCount, _settings.MaxCaptureFps, _fpsAvg);
-                int staggerBudget = _staggerController != null ? _staggerController.Budget : _streamCount;
+                /* Over the STREAMING set, not the subset eligible this tick: the
+                   eligible count is already thinned by pacing, so budgeting over it
+                   would apply the rate cap a second time and pull every camera
+                   below it. Which also means the bound does not move with how many
+                   cameras happen to be due, so it stays reportable on a tick where
+                   none are. */
+                int rateBudget = ReadbackScheduler.ConcurrencyBudget(
+                    _streamSubscribedCount, _settings.MaxCaptureFps, _fpsAvg);
+                int staggerBudget = _staggerController != null
+                    ? _staggerController.Budget
+                    : _streamSubscribedCount;
                 budget = Math.Min(rateBudget, staggerBudget);
-                _readbackScheduler.NextTick(_streamCount, budget, _streamPermit);
             }
+            if (_streamCount > 0)
+                ReadbackScheduler.GrantByPriority(_streamCount, budget, _streamPermit);
             _staggerBudget = budget;
 
             // Map the rank-indexed stream permits back onto the full camera list;
@@ -623,17 +671,18 @@ namespace Kerbcast
             // _lastCapturedCount honest).
             for (int i = 0; i < camCount; i++) _capturePermit[i] = false;
             {
-                /* Stamp the grant, not the eligibility: a background camera that was due
-                   but lost the round-robin keeps its old timestamp and stays due,
-                   so a busy tick delays it rather than silently skipping a whole
-                   interval. */
+                /* Stamp the grant, not the eligibility: a camera that was due but
+                   lost the draw keeps its deadline and stays due, so a busy tick
+                   delays it rather than silently skipping a whole interval. It
+                   also gets more overdue, which is what puts it at the front of
+                   the next tick's order. */
                 float now = Time.unscaledTime;
                 for (int rank = 0; rank < _streamCount; rank++)
                 {
                     if (!_streamPermit[rank]) continue;
                     int idx = _subscribedIdx[rank];
                     _capturePermit[idx] = true;
-                    _cameras[idx].MarkCaptureGranted(now);
+                    _cameras[idx].MarkCaptureGranted(now, _streamEff[rank]);
                 }
             }
 
@@ -1237,12 +1286,16 @@ namespace Kerbcast
             // time so dwell tracks wall-clock, not in-game time (timewarp).
             double msPerCam = _kerbcastFrameMs / (_lastCapturedCount > 0 ? _lastCapturedCount : 1);
             int before = _staggerController.Budget;
-            // Budgeted over the SUBSCRIBED set (_streamCount), not all attached.
-            // _fpsAvg feeds the one-way physics-floor safety (MinKspFps).
+            /* Budgeted over the STREAMING set, not all attached and not the
+               subset eligible this tick: the count is the controller's budget
+               ceiling, so feeding it a pacing-thinned number would clamp the
+               budget to the smallest momentary dip and then make it climb back
+               one step per release dwell. _fpsAvg feeds the one-way
+               physics-floor safety (MinKspFps). */
             int budget = _staggerController.Evaluate(
-                _kerbcastFrameMs, msPerCam, _streamCount, _fpsAvg, Time.unscaledTime);
+                _kerbcastFrameMs, msPerCam, _streamSubscribedCount, _fpsAvg, Time.unscaledTime);
             if (budget != before)
-                Debug.Log($"[Kerbcast] stagger budget={budget}/{_streamCount} streaming "
+                Debug.Log($"[Kerbcast] stagger budget={budget}/{_streamSubscribedCount} streaming "
                     + $"(kerbcast {_kerbcastFrameMs:F1}ms, {msPerCam:F1}ms/cam, KSP {_fpsAvg:F0}fps, "
                     + $"max {_settings.MaxKerbcastFrameBudgetMs:F0}ms, floor {_settings.MinKspFps:F0}fps) "
                     + $"[{_staggerController.LastChangeReason}]");
@@ -1255,12 +1308,12 @@ namespace Kerbcast
             {
                 int qBefore = _qualityController.Level;
                 int qLevel = _qualityController.Evaluate(
-                    _kerbcastFrameMs, budget, _streamCount, _fpsAvg, Time.unscaledTime);
+                    _kerbcastFrameMs, budget, _streamSubscribedCount, _fpsAvg, Time.unscaledTime);
                 if (qLevel != qBefore)
                 {
                     Debug.Log($"[Kerbcast] stagger quality level={qLevel}/{KerbcastCamera.MaxShedLevel} "
                         + $"({_qualityController.LastChangeReason}; kerbcast {_kerbcastFrameMs:F1}ms, "
-                        + $"KSP {_fpsAvg:F0}fps, budget {budget}/{_streamCount}, "
+                        + $"KSP {_fpsAvg:F0}fps, budget {budget}/{_streamSubscribedCount}, "
                         + $"max {_settings.MaxKerbcastFrameBudgetMs:F0}ms, floor {_settings.MinKspFps:F0}fps)");
                     for (int i = 0; i < _cameras.Count; i++)
                         _cameras[i].ApplyAutoShed(qLevel);

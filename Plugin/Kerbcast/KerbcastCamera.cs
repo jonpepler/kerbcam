@@ -221,9 +221,12 @@ namespace Kerbcast
         private CapturePacing _pacing;
         public float EffectiveCaptureFps(float primaryFps, float backgroundCeilingFps)
             => _pacing.Effective(primaryFps, backgroundCeilingFps);
-        public bool CaptureDue(float now, float effectiveFps, float primaryFps)
-            => _pacing.Due(now, effectiveFps, primaryFps);
-        public void MarkCaptureGranted(float now) => _pacing.MarkGranted(now);
+        public bool CaptureDue(float now, float effectiveFps)
+            => _pacing.Due(now, effectiveFps);
+        public float CaptureOverdue(float now, float effectiveFps)
+            => _pacing.Overdue(now, effectiveFps);
+        public void MarkCaptureGranted(float now, float effectiveFps)
+            => _pacing.MarkGranted(now, effectiveFps);
 
         private bool _disposed;
         private bool _firstRender = true;

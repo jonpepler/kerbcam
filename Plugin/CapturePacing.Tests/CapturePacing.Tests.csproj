@@ -18,6 +18,9 @@
 
   <ItemGroup>
     <Compile Include="../Kerbcast/CapturePacing.cs" />
+    <!-- The rate cap is a property of pacing AND staggering together, so the
+         scheduler is compiled in too and the whole per-tick loop is simulated. -->
+    <Compile Include="../Kerbcast/ReadbackScheduler.cs" />
   </ItemGroup>
 
 </Project>

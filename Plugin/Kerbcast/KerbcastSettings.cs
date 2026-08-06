@@ -95,9 +95,9 @@ namespace Kerbcast
            or layer changes). */
         public bool AdaptiveQuality { get; private set; } = true;
 
-        // Per-camera capture-rate CEILING (stream target). Cameras are
-        // round-robined so they don't all render + read back on the same frame,
-        // and each captures at MOST this rate rather than the full game fps. Set
+        // Per-camera capture-rate CEILING (stream target). Each camera paces
+        // itself against its own elapsed time, so it captures at MOST this rate
+        // rather than the full game fps, whatever the other cameras are doing. Set
         // >= your game fps cap to disable the rate cap (the frame budget below
         // still applies).
         public float MaxCaptureFps { get; private set; } = 30f;
