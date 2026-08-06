@@ -779,13 +779,33 @@ jobs:
       # continue-on-error because a missing changelog must not block a
       # release after the expensive Unity builds; the notes fall back to a
       # plain git log below.
+      # Span back to the last STABLE tag, not simply the previous one. Cutting
+      # v1.9.1-rc.1 before v1.9.1 made --latest cover only rc..final, so the
+      # four bug fixes (all of which landed in the rc) vanished from the listing
+      # and players saw a release note with no fixes in it. A pre-release is
+      # never public, so the range that matters is stable-to-stable.
+      - name: Resolve changelog range
+        id: clrange
+        run: |
+          set -eu
+          TAG="${GITHUB_REF_NAME}"
+          PREV_STABLE="$(git tag --sort=-creatordate --merged "${TAG}^" \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)"
+          if [ -n "$PREV_STABLE" ]; then
+            echo "range=${PREV_STABLE}..${TAG}" >> "$GITHUB_OUTPUT"
+            echo "changelog range: ${PREV_STABLE}..${TAG}"
+          else
+            echo "range=" >> "$GITHUB_OUTPUT"
+            echo "changelog range: (no previous stable tag, using --latest)"
+          fi
+
       - name: Generate changelog
         uses: orhun/git-cliff-action@v4
         id: git-cliff
         continue-on-error: true
         with:
           config: cliff.toml
-          args: --latest --strip all
+          args: ${{ steps.clrange.outputs.range != '' && steps.clrange.outputs.range || '--latest' }} --strip all
 
       - name: Create GitHub Release
         env:
