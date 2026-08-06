@@ -84,6 +84,27 @@ rm "$CARGO.bak"
 ( cd "$(dirname "$TS_PKG")" && npm pkg set version="$NEW" >/dev/null )
 ( cd "$(dirname "$REACT_PKG")" && npm pkg set version="$NEW" >/dev/null )
 
+# KSP .version files (AVC). Their format is numeric MAJOR/MINOR/PATCH/BUILD and
+# cannot carry a pre-release suffix, so they take the BASE version: 1.9.1-rc.1
+# lands as 1.9.1. release.yml's version-sync check compares them against the
+# tag with the suffix stripped, for the same reason.
+BASE="${NEW%%-*}"
+IFS=. read -r B_MAJ B_MIN B_PAT <<EOF
+$BASE
+EOF
+for AVC in GameData/Kerbcast/Kerbcast.version GameData/KerbcastKos/KerbcastKos.version; do
+  [ -f "$AVC" ] || continue
+  python3 - "$AVC" "$B_MAJ" "$B_MIN" "$B_PAT" <<'PYEOF'
+import json, sys
+path, maj, mnr, pat = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+d = json.load(open(path))
+d["VERSION"] = {"MAJOR": maj, "MINOR": mnr, "PATCH": pat, "BUILD": 0}
+json.dump(d, open(path, "w"), indent=4)
+open(path, "a").write("\n")
+PYEOF
+  echo "  $AVC -> $BASE"
+done
+
 # Cargo.lock -- rerun cargo to refresh the lockfile's [[package]] entry for
 # kerbcast-sidecar.
 if command -v cargo >/dev/null 2>&1; then

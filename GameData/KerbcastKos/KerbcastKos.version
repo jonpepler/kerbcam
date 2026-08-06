@@ -1,26 +1,26 @@
 {
-  "NAME": "KerbcastKos",
-  "URL": "https://raw.githubusercontent.com/ksp-gonogo/kerbcast/main/GameData/KerbcastKos/KerbcastKos.version",
-  "DOWNLOAD": "https://github.com/ksp-gonogo/kerbcast/releases",
-  "VERSION": {
-    "MAJOR": 1,
-    "MINOR": 9,
-    "PATCH": 0,
-    "BUILD": 0
-  },
-  "KSP_VERSION": {
-    "MAJOR": 1,
-    "MINOR": 12,
-    "PATCH": 5
-  },
-  "KSP_VERSION_MIN": {
-    "MAJOR": 1,
-    "MINOR": 12,
-    "PATCH": 0
-  },
-  "KSP_VERSION_MAX": {
-    "MAJOR": 1,
-    "MINOR": 12,
-    "PATCH": 5
-  }
+    "NAME": "KerbcastKos",
+    "URL": "https://raw.githubusercontent.com/ksp-gonogo/kerbcast/main/GameData/KerbcastKos/KerbcastKos.version",
+    "DOWNLOAD": "https://github.com/ksp-gonogo/kerbcast/releases",
+    "VERSION": {
+        "MAJOR": 1,
+        "MINOR": 9,
+        "PATCH": 1,
+        "BUILD": 0
+    },
+    "KSP_VERSION": {
+        "MAJOR": 1,
+        "MINOR": 12,
+        "PATCH": 5
+    },
+    "KSP_VERSION_MIN": {
+        "MAJOR": 1,
+        "MINOR": 12,
+        "PATCH": 0
+    },
+    "KSP_VERSION_MAX": {
+        "MAJOR": 1,
+        "MINOR": 12,
+        "PATCH": 5
+    }
 }

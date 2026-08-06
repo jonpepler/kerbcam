@@ -128,7 +128,13 @@ jobs:
           # the compatibility contract.
           KOS_VER="$(python3 -c "import json; v=json.load(open('GameData/KerbcastKos/KerbcastKos.version'))['VERSION']; print(f\"{v['MAJOR']}.{v['MINOR']}.{v['PATCH']}\")")"
           echo "tag=$TAG_VER cargo=$CARGO_VER typescript=$PKG_VER react=$REACT_VER avc=$AVC_VER kos=$KOS_VER"
-          if [ "$TAG_VER" != "$CARGO_VER" ] || [ "$CARGO_VER" != "$PKG_VER" ] || [ "$PKG_VER" != "$REACT_VER" ] || [ "$REACT_VER" != "$AVC_VER" ] || [ "$AVC_VER" != "$KOS_VER" ]; then
+          # The AVC (.version) files are numeric MAJOR/MINOR/PATCH and cannot
+          # carry a pre-release suffix, so they are compared against the BASE
+          # version: for v1.9.1-rc.1 the tag, Cargo and packages must all read
+          # 1.9.1-rc.1 while the AVC files read 1.9.1. Comparing them against
+          # the full tag makes a pre-release impossible to cut.
+          BASE_VER="${TAG_VER%%-*}"
+          if [ "$TAG_VER" != "$CARGO_VER" ] || [ "$CARGO_VER" != "$PKG_VER" ] || [ "$PKG_VER" != "$REACT_VER" ] || [ "$BASE_VER" != "$AVC_VER" ] || [ "$AVC_VER" != "$KOS_VER" ]; then
             echo "::error::version mismatch: run ./scripts/bump-version.sh $TAG_VER and re-tag"
             exit 1
           fi
