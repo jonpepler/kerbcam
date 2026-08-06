@@ -7,5 +7,8 @@
     "build": "pnpm -r build",
     "test": "pnpm -r test",
     "typecheck": "pnpm -r typecheck"
+  },
+  "dependencies": {
+    "@ksp-gonogo/kerbcast": "^1.9.0"
   }
 }
