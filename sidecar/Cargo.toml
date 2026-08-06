@@ -1,6 +1,6 @@
 [package]
 name = "kerbcast-sidecar"
-version = "1.9.1-rc.1"
+version = "1.9.1"
 edition = "2021"
 description = "kerbcast KSP camera-streaming sidecar (per-OS hardware encode + WebRTC)"
 license = "CC-BY-NC-SA-4.0"
