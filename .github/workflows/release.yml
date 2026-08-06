@@ -940,7 +940,9 @@ jobs:
       # re-pin from the zip we just published. Runs on main, not the tag: the
       # pin must land where users fetch the raw file from.
       - name: Re-pin Kerbcast.ckan + KerbcastKos.ckan on main
-        if: startsWith(github.ref_name, 'v')
+        # NOT for pre-releases: these files are what CKAN indexes, so pinning
+        # them at an rc advertises a test cut as the current version.
+        if: startsWith(github.ref_name, 'v') && !contains(github.ref_name, '-')
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
