@@ -890,7 +890,9 @@ jobs:
       # Skips cleanly until that variable is set, independently of the core
       # SpaceDock step above.
       - name: Publish KerbcastKos to SpaceDock
-        if: startsWith(github.ref_name, 'v')
+        # NOT for pre-releases, same as the kerbcast mirror above: SpaceDock
+        # feeds the CKAN index, so an rc here reaches players.
+        if: startsWith(github.ref_name, 'v') && !contains(github.ref_name, '-')
         env:
           SPACEDOCK_USERNAME: ${{ secrets.SPACEDOCK_USERNAME }}
           SPACEDOCK_PASSWORD: ${{ secrets.SPACEDOCK_PASSWORD }}
