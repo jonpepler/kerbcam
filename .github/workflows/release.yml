@@ -179,24 +179,29 @@ jobs:
       # republish a version — so an unguarded publish makes the whole release
       # unrepeatable and strands the bundle behind a job that can never go green
       # again. Publishing itself stays exactly as it was.
+      # A pre-release version publishes under the `next` dist-tag, never
+      # `latest`: an unqualified `npm install @ksp-gonogo/kerbcast` must keep
+      # resolving to the newest STABLE release, not to a test cut.
       - name: Publish @ksp-gonogo/kerbcast to npm
         working-directory: client-sdk/typescript
         run: |
           VER="$(node -p "require('./package.json').version")"
+          case "$VER" in *-*) TAG_ARGS="--tag next";; *) TAG_ARGS="";; esac
           if npm view "@ksp-gonogo/kerbcast@${VER}" version >/dev/null 2>&1; then
             echo "@ksp-gonogo/kerbcast@${VER} is already published; skipping"
           else
-            npm publish
+            npm publish ${TAG_ARGS}
           fi
 
       - name: Publish @ksp-gonogo/kerbcast-react to npm
         working-directory: client-sdk/react
         run: |
           VER="$(node -p "require('./package.json').version")"
+          case "$VER" in *-*) TAG_ARGS="--tag next";; *) TAG_ARGS="";; esac
           if npm view "@ksp-gonogo/kerbcast-react@${VER}" version >/dev/null 2>&1; then
             echo "@ksp-gonogo/kerbcast-react@${VER} is already published; skipping"
           else
-            npm publish
+            npm publish ${TAG_ARGS}
           fi
 
   # One sidecar per supported runtime. Linux must build on ubuntu-22.04 (glibc
@@ -808,11 +813,17 @@ jobs:
             echo ""
             echo "</details>"
           } > release-notes.md
+          # A tag carrying a pre-release suffix (v1.9.1-rc.1) is a test cut, not
+          # a release: mark it so GitHub does not show it as "Latest" and nobody
+          # downloads it by accident.
+          PRERELEASE_FLAG=""
+          case "${TAG}" in *-*) PRERELEASE_FLAG="--prerelease";; esac
           gh release create "${TAG}" \
             "${{ env.RELEASE_ZIP }}" \
             "${{ env.KOS_RELEASE_ZIP }}" \
             Plugin/obj/Release/Kerbcast.dll \
             --title "kerbcast ${TAG}" \
+            ${PRERELEASE_FLAG} \
             --notes-file release-notes.md
 
       # Mirror the release onto SpaceDock so its version list (and the CKAN
@@ -823,7 +834,9 @@ jobs:
       # ckan re-pin switches the working tree to main, so the assembled zip and
       # Kerbcast.version are still on disk.
       - name: Publish to SpaceDock
-        if: startsWith(github.ref_name, 'v')
+        # NOT for pre-releases: SpaceDock feeds the CKAN index, so mirroring an
+        # rc would ship a test cut to players.
+        if: startsWith(github.ref_name, 'v') && !contains(github.ref_name, '-')
         env:
           SPACEDOCK_USERNAME: ${{ secrets.SPACEDOCK_USERNAME }}
           SPACEDOCK_PASSWORD: ${{ secrets.SPACEDOCK_PASSWORD }}
