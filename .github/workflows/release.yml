@@ -293,7 +293,7 @@ jobs:
             | grep -v libva \
             || true)"
           if [ -z "$deps" ]; then
-            echo "::error::ldd found no bundleable non-system deps — refusing to upload a non-self-contained artefact"
+            echo "::error::ldd found no bundleable non-system deps: refusing to upload a non-self-contained artefact"
             ldd staging-sidecar/kerbcast-sidecar
             exit 1
           fi
@@ -328,10 +328,10 @@ jobs:
           HAS_SIGNING: ${{ secrets.APPLE_CODESIGN_P12_BASE64 != '' }}
         run: |
           if [ "$HAS_SIGNING" != "true" ]; then
-            echo "::notice::APPLE_CODESIGN_* secrets absent — shipping unsigned macOS sidecar (Gatekeeper will quarantine)"
+            echo "::notice::APPLE_CODESIGN_* secrets absent: shipping unsigned macOS sidecar (Gatekeeper will quarantine)"
             exit 0
           fi
-          echo "::error::macOS codesign+notarytool not yet implemented — TODO: import APPLE_CODESIGN_P12_BASE64 into a temp keychain, codesign --options runtime staging-sidecar/${{ matrix.bin }}, then notarytool submit + staple"
+          echo "::error::macOS codesign+notarytool not yet implemented: TODO: import APPLE_CODESIGN_P12_BASE64 into a temp keychain, codesign --options runtime staging-sidecar/${{ matrix.bin }}, then notarytool submit + staple"
           exit 1
 
       - name: Sign (Windows)
@@ -341,10 +341,10 @@ jobs:
           HAS_SIGNING: ${{ secrets.WINDOWS_CERT_PFX_BASE64 != '' }}
         run: |
           if [ "$HAS_SIGNING" != "true" ]; then
-            echo "::notice::WINDOWS_CERT_PFX_BASE64 absent — shipping unsigned Windows sidecar (SmartScreen friction on first run)"
+            echo "::notice::WINDOWS_CERT_PFX_BASE64 absent: shipping unsigned Windows sidecar (SmartScreen friction on first run)"
             exit 0
           fi
-          echo "::error::Windows signtool step not yet implemented — TODO: decode WINDOWS_CERT_PFX_BASE64 and signtool sign /fd sha256 /tr <timestamp> staging-sidecar/${{ matrix.bin }}"
+          echo "::error::Windows signtool step not yet implemented: TODO: decode WINDOWS_CERT_PFX_BASE64 and signtool sign /fd sha256 /tr <timestamp> staging-sidecar/${{ matrix.bin }}"
           exit 1
 
       - name: Upload per-rid sidecar artifact
@@ -720,7 +720,7 @@ jobs:
           for rid in linux-x64 osx-arm64 win-x64; do
             src="sidecar-artifacts/kerbcast-sidecar-${rid}"
             if [ ! -d "$src" ]; then
-              echo "::error::missing ${rid} sidecar artifact — refusing to cut a release that omits an OS"
+              echo "::error::missing ${rid} sidecar artifact: refusing to cut a release that omits an OS"
               exit 1
             fi
             mkdir -p "GameData/Kerbcast/Sidecar/${rid}"
@@ -806,9 +806,9 @@ jobs:
             echo "4. Go to <ksp-ip>:<port> (configured in settings.cfg) to connect to streams."
             echo ""
             echo "## Assets"
-            echo "- \`kerbcast-${TAG}.zip\` — complete install tree (plugin + sidecar + shader bundles + settings)"
-            echo "- \`Kerbcast.dll\` — plugin DLL only (for manual installs)"
-            echo "- \`KerbcastKos-${TAG}.zip\` — optional kOS addon (requires kOS; GPL-3.0). Install alongside kerbcast for kerboscript camera control."
+            echo "- \`kerbcast-${TAG}.zip\`: complete install tree (plugin + sidecar + shader bundles + settings)"
+            echo "- \`Kerbcast.dll\`: plugin DLL only (for manual installs)"
+            echo "- \`KerbcastKos-${TAG}.zip\`: optional kOS addon (requires kOS; GPL-3.0). Install alongside kerbcast for kerboscript camera control."
             echo ""
             echo "> TypeScript SDK \`@ksp-gonogo/kerbcast@${TAG#v}\` and \`@ksp-gonogo/kerbcast-react@${TAG#v}\` published to npm."
             echo ""
@@ -863,7 +863,10 @@ jobs:
             PREV_TAG="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
             CHANGELOG="$(git log --oneline ${PREV_TAG:+${PREV_TAG}..}${TAG})"
           fi
-          printf '%s\n' "$CHANGELOG" > sd-changelog.md
+          # Players read this, not contributors: keep Features and Bug Fixes,
+          # acknowledge the rest on one trailer line. Also puts a blank line
+          # after each heading so the bullets do not collapse into one line.
+          printf '%s\n' "$CHANGELOG" | python3 scripts/spacedock-changelog.py > sd-changelog.md
 
           # 1) cookie login (SpaceDock has no API tokens)
           login="$(curl -sS -F username="$SPACEDOCK_USERNAME" -F password="$SPACEDOCK_PASSWORD" -c ./sd-cookies https://spacedock.info/api/login)"
@@ -913,7 +916,10 @@ jobs:
             PREV_TAG="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
             CHANGELOG="$(git log --oneline ${PREV_TAG:+${PREV_TAG}..}${TAG})"
           fi
-          printf '%s\n' "$CHANGELOG" > sd-kos-changelog.md
+          # Players read this, not contributors: keep Features and Bug Fixes,
+          # acknowledge the rest on one trailer line. Also puts a blank line
+          # after each heading so the bullets do not collapse into one line.
+          printf '%s\n' "$CHANGELOG" | python3 scripts/spacedock-changelog.py > sd-kos-changelog.md
 
           login="$(curl -sS -F username="$SPACEDOCK_USERNAME" -F password="$SPACEDOCK_PASSWORD" -c ./sd-kos-cookies https://spacedock.info/api/login)"
           if printf '%s' "$login" | grep -q '"error"[[:space:]]*:[[:space:]]*true'; then

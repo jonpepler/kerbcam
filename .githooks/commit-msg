@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Reject em dashes (and en dashes) in commit messages.
+#
+# Commit subjects flow verbatim into the GitHub release notes, the SpaceDock
+# changelog and the CKAN listing, so a stray em dash is not a private style
+# slip: it ends up on a public mod page, permanently, because SpaceDock version
+# history cannot be edited after the fact. That happened in v1.9.0.
+set -eu
+MSG_FILE="$1"
+# Ignore comment lines git adds to the template.
+if grep -vE '^\s*#' "$MSG_FILE" | grep -qE '—|–'; then
+  echo "commit-msg: em/en dash found in the commit message." >&2
+  echo >&2
+  grep -vE '^\s*#' "$MSG_FILE" | grep -nE '—|–' | sed 's/^/  /' >&2
+  echo >&2
+  echo "Use a comma, colon, parentheses, or a separate sentence instead." >&2
+  exit 1
+fi
